@@ -22,9 +22,9 @@ untrusted projects, scripts, skills and TeX before running them.
 ## Reporting
 
 Do not put credentials, private research or exploit details in public issues.
-This repository is private. A dedicated security reporting channel has not yet
-been configured. Configure private vulnerability reporting before public launch.
-Until then, use an existing private channel with the repository owner.
+For sensitive reports, use GitHub private vulnerability reporting when available
+or an existing private channel with the repository owner. Do not use a public
+issue for confidential details.
 
 See [architecture](docs/architecture.md) for process boundaries and
 [release preparation](docs/release-process.md) for distribution checks.

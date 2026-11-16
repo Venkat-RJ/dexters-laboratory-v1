@@ -14,8 +14,8 @@ workflow. Preparing it does not commit, push, publish or distribute an applicati
 3. Keep LICENSE, NOTICE and third-party licenses. Review unresolved dependency
    licensing entries in THIRD_PARTY_NOTICES.md.
 4. Run the relevant frontend and native checks documented in CONTRIBUTING.md.
-5. Configure the actual repository URL and a private vulnerability-reporting
-   channel after choosing the repository. No public URL is assumed here.
+5. Repository: https://github.com/Venkat-RJ/dexters-laboratory-v1. Keep a private
+   vulnerability-reporting channel available for sensitive reports.
 6. Review and commit only when the owner explicitly requests it.
 
 ## Before distributing a binary

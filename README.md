@@ -2,7 +2,7 @@
 
 A local research workspace built on [Lattice](https://github.com/leo1oel/lattice).
 
-Maintained in the separate private repository
+Source repository:
 [Venkat-RJ/dexters-laboratory-v1](https://github.com/Venkat-RJ/dexters-laboratory-v1).
 Private research and knowledge are not included.
 

@@ -60,4 +60,8 @@ publishing and audit the exact binary separately before distribution.
 
 See [release-process.md](release-process.md) for remaining distribution and
 repository-configuration steps, including dependency licensing and private
-vulnerability reporting. The repository remains private; no public release has been made.
+vulnerability reporting. After the initial private push, the owner authorized
+public source access. The exact initial commit was archived and scanned again:
+all 4,778 files were checked with no flagged content, no skipped generated trees,
+and only the neutral knowledge starter. This publication does not include a
+packaged application release.

@@ -1,0 +1,981 @@
+/**
+ * Live editing against Overleaf for the file currently open.
+ *
+ * This owns the connection, the map from project paths to Overleaf document
+ * ids, and the per-document state machine. Local edits leave as operations a
+ * moment after they are typed; a collaborator's arrive as operations and are
+ * applied to the buffer, which keeps the caret and the place with their text.
+ *
+ * It is deliberately failure-tolerant: anything unexpected — a rejected
+ * update, a document that drifted, a dropped connection — stops the live
+ * channel and leaves the existing sync to keep the project correct. A live
+ * channel is an improvement on syncing, never a replacement for it.
+ */
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
+import { msg } from "@lingui/core/macro";
+import { useLingui } from "@lingui/react/macro";
+import { invoke } from "@tauri-apps/api/core";
+import { toMessage } from "../app-utils";
+import { useStoreSlice } from "../hooks/use-store-slice";
+import { i18n } from "../i18n";
+import { hostErrorText } from "../platform/host-error-text";
+import { OtDocument, preciseOps, type OtOp } from "./ot";
+import { channelFields, projectAccess } from "./overleaf-connection-store";
+import { DocumentProofs, joinDelivery } from "./overleaf-document-proof";
+import { onOverleafEvent } from "./overleaf-realtime-listen";
+import { useOverleafRealtimeConnection } from "./use-overleaf-realtime-connection";
+import type { Suggester } from "./overleaf-suggestions";
+import { useOpenDocReview } from "./use-open-doc-review";
+import { useOverleafDocumentTree } from "./use-overleaf-document-tree";
+import {
+  driftNotice, isOwnUpdate, overleafDocHash, replacedNotice, retrying, unconfirmedNotice, unprovenJoin,
+  type CommentRange, type DocUpdateEvent, type JoinedDoc, type OverleafCommentTarget,
+  type OverleafRealtimeOptions, type OverleafRemoteTextContext, type ReservedOperation, type TrackedChange,
+} from "./overleaf-realtime-model";
+
+export type { OverleafCommentTarget, OverleafRemoteTextContext, ReservedOperation, TrackedChange };
+
+/** Shared empty arrays, so "none" is a stable reference across renders. */
+const EMPTY_COMMENTS: CommentRange[] = [];
+const EMPTY_CHANGES: TrackedChange[] = [];
+/** How long a document that will not settle is allowed to hold the channel. */
+const DRAIN_TIMEOUT_MS = 15_000;
+/** At most this often per document, an update carries the hash of the text it produces. */
+const HASH_INTERVAL_MS = 5_000;
+/**
+ * Typing is coalesced into one operation for at most this long, counted from
+ * the first keystroke not yet sent — never pushed back by the ones after it,
+ * or someone typing without a pause would send nothing until they stopped.
+ */
+const SEND_INTERVAL_MS = 250;
+/** Between attempts to re-read a document a reject left stale. */
+const RESYNC_RETRY_MS = 2_000;
+
+export function useOverleafRealtime(options: OverleafRealtimeOptions) {
+  // For rendered text and caller-initiated actions only. `t` changes identity
+  // with the interface language, so anything the connection or open-document
+  // effects depend on translates through `i18n._(msg…)` instead: a dependency
+  // on `t` turns a language change into a disconnect and a failed handoff.
+  const { t } = useLingui();
+  const { store } = options;
+  const { status, detail, liveFile, unacknowledged, projectPermission } = useStoreSlice(store, channelFields);
+  const { setStatus, setDetail, setLiveFile, setUnacknowledged } = store.getState();
+  // Bumped to re-join the open document, which is how the suggestion list is
+  // re-read: accepting one is an endpoint, not an operation, so nothing on the
+  // channel would otherwise tell us the ranges moved.
+  const [reloadNonce, bumpReloadNonce] = useReducer(increment, 0);
+
+  const publicId = useRef<string | null>(null);
+  const suspendedPaths = useRef(new Set<string>());
+  useEffect(() => () => suspendedPaths.current.clear(), [options.projectRoot]);
+  /**
+   * Every document this connection is holding, which is not the same as the
+   * one on screen. A document that still owes the server an operation stays
+   * here after the writer has moved on, because the answer is addressed to it
+   * and arrives on the channel regardless of what is being looked at — throw
+   * it away at the moment of switching and the last edit made in it goes too.
+   */
+  const documents = useRef<Map<string, OtDocument>>(new Map());
+  const { docs, entities, livePaths, pathsByDocId, publishLivePaths, noteDocumentTree } = useOverleafDocumentTree(documents, store);
+  /** Updates received after joining a room but before its snapshot reaches React. */
+  const joiningUpdates = useRef<Map<string, DocUpdateEvent[]>>(new Map());
+  /** Documents kept alive only until they settle, then left. */
+  const draining = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  /**
+   * A send whose outcome could not be proven. These documents remain owned by
+   * OT — and therefore excluded from ordinary sync — until a late ack or
+   * catch-up proves what happened.
+   */
+  const uncertain = useRef<Set<string>>(new Set());
+  const reconciling = useRef<Set<string>>(new Set());
+  /** The one being edited: local typing goes here, and it drives the editor. */
+  const docId = useRef<string | null>(null);
+  const sendTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Typed but not yet sent (see `SEND_INTERVAL_MS`), so not yet in the document. */
+  const unsentText = useRef<string | null>(null);
+  /** Set by `reload`: take the server's copy instead of resuming from ours. */
+  const forceFullJoin = useRef(false);
+  /** Copies missing an operation sent outside them (a reject's inverse): nothing is sent or applied until a full join. */
+  const resyncing = useRef(new Set<string>());
+  const flushRef = useRef<(id: string | null, send: { version: number; ops: OtOp[] } | null, dupIfSource?: readonly string[]) => Promise<void>>(async () => undefined);
+  const reconcileUnknownRef = useRef<(id: string) => void>(() => undefined);
+  const sendTypingRef = useRef<(id: string) => void>(() => undefined);
+  const requestReconnectRef = useRef<(reason: string, immediate?: boolean) => void>(() => undefined);
+  /** The root that owns every document currently held by this hook. */
+  const connectionRoot = useRef<string | null>(null);
+  const remoteDeliveries = useRef(new WeakMap<OtDocument, { tail: Promise<void>; pending: number }>());
+  const proofs = useRef(new DocumentProofs());
+  const proofOf = (doc: OtDocument) => proofs.current.of(doc);
+  const leaving = useRef(new Map<string, Promise<boolean>>());
+  /** Connections lost, counted once their documents are released; see `release`. */
+  const drops = useRef(0);
+  const documentEpoch = useRef(0);
+  /** When each document last sent a hash; see `HASH_INTERVAL_MS`. */
+  const lastHashed = useRef(new WeakMap<OtDocument, number>());
+  /** Said once per session: see `asOverleafStores` in ./ot. */
+  const toldAboutReplacement = useRef(false);
+  const noteReplaced = () => {
+    if (toldAboutReplacement.current) return;
+    toldAboutReplacement.current = true;
+    callbacks.current.onNotice(replacedNotice());
+  };
+
+  const { permission, canWrite } = projectAccess(projectPermission, options.projectRoot);
+  // Read through refs inside the event listener so it can stay mounted for the
+  // whole session instead of being torn down on every keystroke.
+  const callbacks = useRef(options);
+  const canContribute = useRef(canWrite);
+  useLayoutEffect(() => {
+    callbacks.current = options;
+    canContribute.current = canWrite;
+  });
+
+  /** Whether `source` is us: this connection, or an earlier one that carried `doc`'s unanswered operation. */
+  const isMine = (source: string | null, doc?: OtDocument) => isOwnUpdate(source, publicId.current, doc?.submittedVia);
+  /**
+   * After a replay on a new connection, send the still-unanswered operation
+   * again, naming every connection it went out on before. If one of those
+   * already landed it, Overleaf acknowledges the resend instead of applying it
+   * twice; if none did, this is the operation finally arriving. This is what
+   * Overleaf's own editor does on reconnect. On the connection that already
+   * carried it, nothing is resent: a missing answer there may still come.
+   */
+  const resendAfterReplay = (id: string, doc: OtDocument) => {
+    const current = publicId.current;
+    const earlier = doc.submittedVia;
+    if (!current || !doc.waiting || !earlier.length || earlier.includes(current)) return;
+    const send = doc.resend();
+    if (send) void flushRef.current(id, send, send.dupIfSource);
+  };
+  const deliveryPending = (doc: OtDocument | null | undefined) => Boolean(doc && remoteDeliveries.current.get(doc)?.pending);
+  const openDocument = () => (docId.current ? documents.current.get(docId.current) : undefined);
+  /** Typing not yet sent has not entered OtDocument yet, but it is still local work. */
+  const typingUnsent = () => sendTimer.current !== null || unsentText.current !== null;
+  /** Re-join a `resyncing` doc once nothing of ours is outstanding: after an ack, a settling replay, a delivery. */
+  const resyncIfDue = useCallback((id: string) => {
+    const doc = documents.current.get(id);
+    if (!resyncing.current.has(id) || docId.current !== id || !doc?.settled || deliveryPending(doc) || uncertain.current.has(id)) return;
+    bumpReloadNonce();
+  }, []);
+  const { openDoc, setOpenDoc, patchOpenDoc, shiftAnchors, onReviewEvent, noteProject, suggester } = useOpenDocReview((id) => {
+    const doc = documents.current.get(id);
+    const projectRoot = connectionRoot.current;
+    return doc && projectRoot && docId.current === id && doc.settled && !typingUnsent() && !deliveryPending(doc)
+      && !uncertain.current.has(id) && !leaving.current.has(id) && !resyncing.current.has(id) ? { doc, projectRoot } : null;
+  });
+  const clearSendTimer = () => {
+    if (sendTimer.current) clearTimeout(sendTimer.current);
+    sendTimer.current = null;
+  };
+  /**
+   * Say whether the open document holds local work Overleaf has not
+   * acknowledged: typing not yet sent, an operation on the wire or queued
+   * behind one, or a send whose outcome is unknown. Being
+   * connected is not the same as being synchronized, and the save slot only
+   * says "Synced" once this is false. Called wherever one of those changes,
+   * as they all live in refs and OtDocument, which React does not watch.
+   */
+  const publishUnacknowledged = useCallback(() => {
+    const id = docId.current;
+    const doc = id ? documents.current.get(id) : undefined;
+    setUnacknowledged(Boolean(id && doc && (typingUnsent() || !doc.settled || uncertain.current.has(id) || resyncing.current.has(id))));
+  }, [setUnacknowledged]);
+  const cancelDrain = (id: string) => {
+    clearTimeout(draining.current.get(id));
+    draining.current.delete(id);
+  };
+
+  /** Let go of a document for good: leave the room and forget it. */
+  const release = useCallback((id: string) => {
+    if (leaving.current.has(id)) return;
+    const doc = documents.current.get(id);
+    const projectRoot = connectionRoot.current;
+    if (!doc || !projectRoot) return;
+    cancelDrain(id);
+    const proof = proofOf(doc);
+    const checkpoint = proof.checkpoint(doc);
+    const drop = drops.current;
+    // Rust checkpoints under the sync lease before leaving. Keep frontend
+    // ownership too until IPC succeeds; a failed write must not enable REST.
+    // Except once the connection drops: its rooms close with it, so the leave
+    // fails, and a settled document owes nothing. Held, it would stay out of
+    // every sync with no operation able to reach it, Overleaf's edits never
+    // landing here.
+    const pending = invoke("overleaf_rt_leave_doc", {
+      projectRoot, docId: id, receipt: proof.receipt, checkpoint,
+    }).then(() => "checkpointed" as const, (reason) => {
+      if (drops.current !== drop && doc.settled) return "released" as const;
+      const detail = String(reason);
+      callbacks.current.onNotice(i18n._(msg`Could not hand this file back to Overleaf sync (${detail}). Syncing remains paused for this file.`));
+      return null;
+    }).then((outcome) => {
+      if (outcome && connectionRoot.current === projectRoot && documents.current.get(id) === doc) {
+        uncertain.current.delete(id);
+        reconciling.current.delete(id);
+        documents.current.delete(id);
+        if (outcome === "checkpointed") proofs.current.park(id, doc, checkpoint);
+        publishLivePaths();
+      }
+      return outcome !== null;
+    }).finally(() => {
+      if (leaving.current.get(id) === pending) leaving.current.delete(id);
+    });
+    leaving.current.set(id, pending);
+  }, [publishLivePaths]);
+
+  /** Release a document that has settled and is no longer the one being edited (or is draining). */
+  const releaseIfDone = useCallback((id: string, doc: OtDocument) => {
+    if (doc.settled && (draining.current.has(id) || docId.current !== id)) release(id);
+  }, [release]);
+
+  /**
+   * Keep an ambiguous send away from ordinary syncing and ask Overleaf to
+   * replay what happened. A timeout is not a rejection: the server may have
+   * committed the operation before its answer was lost.
+   */
+  const markOutcomeUnknown = useCallback((id: string, reason: unknown) => {
+    const first = !uncertain.current.has(id);
+    uncertain.current.add(id);
+    publishLivePaths();
+    publishUnacknowledged();
+    const message = unconfirmedNotice(pathsByDocId.current.get(id), String(reason));
+    if (docId.current === id) setDetail(message);
+    if (first) callbacks.current.onNotice(message);
+    reconcileUnknownRef.current(id);
+  }, [pathsByDocId, publishLivePaths, publishUnacknowledged, setDetail]);
+
+  /**
+   * Stop editing the open document, without necessarily letting go of it.
+   *
+   * Typing not yet sent goes in first — typing a sentence and immediately
+   * clicking another file is the ordinary way to use the app, and cancelling
+   * that timer on the way out is how the sentence used to vanish. If the document still owes the server an operation after that,
+   * it is kept and stays in its room until the answer arrives: releasing it
+   * first would forget the document the acknowledgement and any rejection are
+   * for. (Current Overleaf broadcasts to the whole project and treats
+   * `leaveDoc` as a no-op, but older deployments still route by document
+   * room — docs/overleaf-protocol.md.)
+   */
+  const stopDocument = useCallback(() => {
+    documentEpoch.current += 1;
+    clearSendTimer();
+    const previous = docId.current;
+    const typed = unsentText.current;
+    unsentText.current = null;
+    docId.current = null;
+    setLiveFile(false);
+    setOpenDoc(null);
+    publishUnacknowledged();
+    const doc = previous ? documents.current.get(previous) : undefined;
+    if (!previous || !doc) return;
+
+    if (typed !== null && canContribute.current) {
+      // The last thing typed leaves the same way everything before it did.
+      const { send, replaced } = proofOf(doc).typed(doc, typed);
+      if (replaced) noteReplaced();
+      void flushRef.current(previous, send);
+    }
+    if (doc.settled) {
+      release(previous);
+      return;
+    }
+    // Held until the server answers, and no longer: a document that will never
+    // settle — the connection died mid-operation — must not keep its room for
+    // the rest of the session.
+    draining.current.set(previous, setTimeout(() => {
+      const held = documents.current.get(previous);
+      if (!held || held.settled) release(previous);
+      else markOutcomeUnknown(previous, i18n._(msg`the acknowledgement did not arrive in time`));
+    }, DRAIN_TIMEOUT_MS));
+  }, [markOutcomeUnknown, publishUnacknowledged, release, setLiveFile, setOpenDoc]);
+
+  /** Every document goes, on the way to shutting the connection down. */
+  const stopEverything = useCallback(() => {
+    stopDocument();
+    for (const id of [...documents.current.keys()]) release(id);
+    // Intentional project teardown has no remaining frontend sync owner.
+    documents.current.clear();
+    proofs.current.unpark();
+    leaving.current.clear();
+    resyncing.current.clear();
+    publishLivePaths();
+  }, [publishLivePaths, release, stopDocument]);
+
+  /** Hand disk edits to ordinary sync without discarding unacknowledged OT. */
+  const suspendPaths = useCallback((paths: readonly string[]) => {
+    const { projectRoot, activeFile } = callbacks.current;
+    if (!projectRoot || !paths.length) return;
+    for (const path of paths) suspendedPaths.current.add(path);
+    if (activeFile && suspendedPaths.current.has(activeFile)) {
+      // The buffer and disk no longer share OT's base. Preserve the buffer for
+      // save's three-way merge; only already-owned operations may still drain.
+      unsentText.current = null;
+      stopDocument();
+      bumpReloadNonce();
+    }
+    callbacks.current.onNeedsSync?.(paths);
+  }, [stopDocument]);
+
+  /** Rejoin only files whose ordinary sync completed and whose OT has drained. */
+  const resumePaths = useCallback((paths: readonly string[]) => {
+    const { projectRoot, activeFile } = callbacks.current;
+    if (!projectRoot) return;
+    for (const path of paths) {
+      const owned = [...documents.current.keys()].some((id) => pathsByDocId.current.get(id) === path);
+      if (owned || !suspendedPaths.current.delete(path)) continue;
+      if (path === activeFile) bumpReloadNonce();
+    }
+  }, [pathsByDocId]);
+
+  /**
+   * A broken connection is different from an intentional shutdown: settled
+   * documents can go, but any unacknowledged one has an unknown remote outcome
+   * and must keep blocking ordinary sync.
+   */
+  const stopAfterDisconnect = useCallback((reason: string) => {
+    stopDocument();
+    for (const [id, doc] of [...documents.current.entries()]) {
+      if (doc.settled) release(id);
+      else markOutcomeUnknown(id, reason);
+    }
+    drops.current += 1;
+  }, [markOutcomeUnknown, release, stopDocument]);
+
+  const fail = useCallback((message: string, projectRoot = connectionRoot.current) => {
+    if (!projectRoot || connectionRoot.current !== projectRoot) return;
+    stopAfterDisconnect(message);
+    setStatus("error");
+    setDetail(message);
+    // Disconnecting on purpose emits no `disconnected` event, so ask for the
+    // reconnect here; otherwise one rejection ends live editing for the session.
+    void invoke("overleaf_rt_disconnect", { projectRoot }).catch(() => {}).finally(() => {
+      if (connectionRoot.current === projectRoot) requestReconnectRef.current(message);
+    });
+  }, [setDetail, setStatus, stopAfterDisconnect]);
+
+  /**
+   * Give up on one document without giving up the connection: one file
+   * failing says nothing about the others, or about chat, presence and the
+   * file tree riding the same socket. This file falls back to syncing.
+   */
+  const dropDocument = useCallback((id: string, message: string) => {
+    if (docId.current === id) {
+      docId.current = null;
+      setLiveFile(false);
+      setOpenDoc(null);
+      setDetail(message);
+      publishUnacknowledged();
+    }
+    release(id);
+  }, [publishUnacknowledged, release, setDetail, setLiveFile, setOpenDoc]);
+
+  // OT advances synchronously, but checking/writing the disk crosses IPC. Keep
+  // deliveries ordered and never send an intermediate editor snapshot back
+  // over a newer remote operation. Typing in the meantime is carried onto the
+  // new text (see OverleafRemoteTextContext) and sent once the delivery is
+  // through. A disagreement hands the file back to the ordinary three-way
+  // synchronizer, retaining any unacknowledged OT lease.
+  const deliverRemoteText = useCallback((
+    id: string, text: string, baseContent: string,
+    { ops = preciseOps(baseContent, text), carryTyping = false }: { ops?: OtOp[]; carryTyping?: boolean } = {},
+  ) => {
+    const doc = documents.current.get(id);
+    const projectRoot = connectionRoot.current;
+    const path = pathsByDocId.current.get(id);
+    if (!doc || !projectRoot || !path) return;
+    const epoch = documentEpoch.current;
+    const isCurrent = () => connectionRoot.current === projectRoot
+      && documentEpoch.current === epoch
+      && documents.current.get(id) === doc && docId.current === id
+      && callbacks.current.projectRoot === projectRoot && callbacks.current.activeFile === path;
+    if (!isCurrent()) return;
+    // Unsent typing built on the old text must not go out over the new one;
+    // the buffer still holds it, and it is sent again from there afterwards.
+    clearSendTimer();
+    unsentText.current = null;
+    setLiveFile(false);
+    let queue = remoteDeliveries.current.get(doc);
+    if (!queue) remoteDeliveries.current.set(doc, queue = { tail: Promise.resolve(), pending: 0 });
+    const delivery = queue;
+    delivery.pending += 1;
+    const proof = proofOf(doc);
+    const mark = proof.deliveryMark();
+    const preserveLocal = () => {
+      if (!isCurrent()) return;
+      // Do not publish stale unsent typing as a new replacement operation.
+      // stopDocument drains only operations already owned by OT.
+      suspendPaths([path]);
+      const message = i18n._(msg`This file changed outside live editing. Local work was kept; regular Overleaf sync will reconcile it.`);
+      setDetail(message);
+      if (!callbacks.current.onNeedsSync) callbacks.current.onNotice(message);
+    };
+    delivery.tail = delivery.tail.then(async () => {
+      if (!isCurrent()) return;
+      try {
+        const accepted = await callbacks.current.onRemoteText(text, { projectRoot, path, baseContent, ops, carryTyping, isCurrent });
+        if (accepted === true || (accepted !== false && isCurrent())) {
+          proof.delivered(mark);
+          return;
+        }
+        // Refused, or the writer moved on while it crossed IPC, perhaps after
+        // the disk took it: what the local copy holds is unknown until a delivery lands.
+        proof.lost(doc);
+        if (accepted === false) preserveLocal();
+      } catch {
+        proof.lost(doc);
+        preserveLocal();
+      }
+    }).finally(() => {
+      delivery.pending -= 1;
+      if (!delivery.pending && isCurrent()) setLiveFile(true);
+      resyncIfDue(id);
+    });
+  }, [pathsByDocId, resyncIfDue, setDetail, setLiveFile, suspendPaths]);
+
+  /**
+   * Ask the server to replay from the last version we trust after a send's
+   * acknowledgement went missing.
+   *
+   * If our update is in the replay, `catchUp` treats it as the missing ack. If
+   * it is not, the outcome remains unknown: a late server apply is still
+   * possible, so the document stays held rather than being handed to REST.
+   */
+  const reconcileUnknown = useCallback(async (id: string) => {
+    const doc = documents.current.get(id);
+    const projectRoot = connectionRoot.current;
+    if (reconciling.current.has(id) || !doc || !uncertain.current.has(id) || !projectRoot) return;
+    reconciling.current.add(id);
+    try {
+      const receipt = crypto.randomUUID();
+      const joined = await invoke<JoinedDoc>("overleaf_rt_join_doc", { projectRoot, docId: id, fromVersion: doc.version, receipt });
+      if (connectionRoot.current !== projectRoot || documents.current.get(id) !== doc) return;
+      proofOf(doc).receipt = receipt;
+      if (!joined.resumed) return;
+      const caughtUp = joined.caughtUp ?? [];
+      if (!publicId.current && caughtUp.length) {
+        // With an operation already in flight, replaying a source we cannot
+        // identify may apply our own text a second time. Keep the outcome
+        // unknown until the connection supplies our public id.
+        if (docId.current === id) {
+          setDetail(i18n._(msg`Overleaf replayed updates before Lattice could identify this connection. Syncing remains paused for this file.`));
+        }
+        return;
+      }
+      const sawOurUpdate = caughtUp.some((update) => isMine(update.source, doc));
+      const baseContent = doc.text;
+      const result = proofOf(doc).replay(doc, caughtUp, publicId.current, resyncing.current.has(id));
+      shiftAnchors(id, result.applied);
+      if (docId.current === id) {
+        patchOpenDoc(id, (current) => ({ comments: joined.comments ?? current.comments, changes: joined.changes ?? current.changes }));
+        deliverRemoteText(id, result.text, baseContent, { ops: result.applied, carryTyping: true });
+      }
+      if (result.send) void flushRef.current(id, result.send);
+      else resendAfterReplay(id, doc);
+      if (sawOurUpdate || doc.settled) {
+        uncertain.current.delete(id);
+        publishLivePaths();
+        if (docId.current === id) setDetail(null);
+      }
+      publishUnacknowledged();
+      releaseIfDone(id, doc);
+      resyncIfDue(id);
+    } catch {
+      // Still unknown. Keeping the path in livePaths is the safety mechanism;
+      // a later ack or reconnect can resolve it without a blind retransmit.
+    } finally {
+      if (connectionRoot.current === projectRoot) reconciling.current.delete(id);
+    }
+  }, [deliverRemoteText, patchOpenDoc, publishLivePaths, publishUnacknowledged, releaseIfDone, resyncIfDue, setDetail, shiftAnchors]);
+  useEffect(() => {
+    reconcileUnknownRef.current = (id) => void reconcileUnknown(id);
+  }, [reconcileUnknown]);
+
+  /** Send whatever a document says is ready, if anything. */
+  const flush = useCallback(async (
+    id: string | null, send: { version: number; ops: OtOp[] } | null, dupIfSource: readonly string[] = [],
+  ) => {
+    if (!send || !id) return;
+    const projectRoot = connectionRoot.current;
+    if (!projectRoot) {
+      markOutcomeUnknown(id, i18n._(msg`the Overleaf project connection is no longer active`));
+      return;
+    }
+    const doc = documents.current.get(id);
+    // Recorded before the send can fail: an operation whose answer is lost
+    // with its connection must still be recognised as ours when it is
+    // replayed under this id after a reconnect.
+    doc?.noteSubmitted(publicId.current);
+    // Now and then, say what the document should read once this lands.
+    // Overleaf rejects the update when its copy disagrees, so a copy that has
+    // drifted fails loudly — and falls back to syncing — instead of every
+    // later edit landing in the wrong place. Like Overleaf's own editor, not
+    // on every keystroke: hashing the whole document costs.
+    const sentText = doc && doc.version === send.version ? doc.sentText : null;
+    const now = Date.now();
+    const hashDue = sentText !== null && now - (lastHashed.current.get(doc!) ?? -Infinity) >= HASH_INTERVAL_MS;
+    if (hashDue) lastHashed.current.set(doc!, now);
+    try {
+      const hash = hashDue ? await overleafDocHash(sentText) : null;
+      // Tracked as of sending, as Overleaf's own editor does: typing queued
+      // behind an answer goes out under the setting the answer finds.
+      await invoke("overleaf_rt_send_ops", {
+        projectRoot, docId: id, version: send.version, ops: send.ops, tracked: suggester() !== null,
+        ...(dupIfSource.length ? { dupIfSource } : {}), ...(hash ? { hash } : {}),
+      });
+    } catch (reason) {
+      // A rejected Promise only says the acknowledgement did not reach this
+      // call. The server may already have committed the operation, so handing
+      // the file to REST (or blindly sending the op again) could duplicate or
+      // overwrite it. Keep ownership and reconcile by replaying history.
+      if (connectionRoot.current === projectRoot) markOutcomeUnknown(id, reason);
+    }
+  }, [markOutcomeUnknown, suggester]);
+  useEffect(() => {
+    flushRef.current = flush;
+  }, [flush]);
+
+  // ---- events -------------------------------------------------------------
+  // Registered before anything connects, so nothing the backend emits during
+  // the join can be missed. Only the project this hook is connecting is heard:
+  // a disconnect queued by the previous project must not tear down, or
+  // reconnect, the next one's channel.
+
+  useEffect(() => onOverleafEvent(() => (callbacks.current.enabled ? callbacks.current.projectRoot : null), (payload) => {
+    if (onReviewEvent(payload)) return;
+    switch (payload.type) {
+      case "connected":
+        publicId.current = payload.publicId;
+        for (const id of uncertain.current) reconcileUnknownRef.current(id);
+        return;
+      case "projectJoined":
+      case "treeChanged":
+        // Somebody created, renamed, moved or deleted something; a file that
+        // appeared this way is joinable straight away. A permission is never
+        // taken from these events, only from the connect result: each
+        // handshake must name the role for the connection it set up.
+        noteDocumentTree(payload.docs, payload.type === "treeChanged" ? payload.entities : undefined);
+        return;
+      case "disconnected": {
+        const reason = payload.reason || i18n._(msg`The realtime connection closed.`);
+        stopAfterDisconnect(reason);
+        requestReconnectRef.current(reason);
+        return;
+      }
+      case "otError": {
+        // Overleaf addresses a rejection to the document it happened in, and
+        // one document failing says nothing about the others.
+        if (payload.docId && !documents.current.has(payload.docId)) return;
+        const detail = payload.message;
+        if (payload.docId) dropDocument(payload.docId, i18n._(msg`Overleaf rejected a live update (${detail}).`));
+        else fail(detail);
+        callbacks.current.onNotice(i18n._(msg`Overleaf rejected a live update (${detail}). Falling back to syncing.`));
+        return;
+      }
+      case "docAck": {
+        // Overleaf never sends an operation back to whoever sent it: the
+        // originating client gets the version alone, and that is the
+        // acknowledgement. Answers arrive for a document being drained too,
+        // and that is the point of keeping it.
+        const doc = documents.current.get(payload.docId);
+        if (!doc) return;
+        try {
+          const wasUncertain = uncertain.current.delete(payload.docId);
+          publishLivePaths();
+          void flush(payload.docId, doc.acknowledge(payload.version).send);
+          if (wasUncertain && docId.current === payload.docId) setDetail(null);
+          publishUnacknowledged();
+          releaseIfDone(payload.docId, doc);
+          resyncIfDue(payload.docId);
+        } catch (reason) {
+          dropDocument(payload.docId, toMessage(reason));
+          callbacks.current.onNotice(driftNotice());
+        }
+        return;
+      }
+      case "docUpdate": {
+        const doc = documents.current.get(payload.docId);
+        if (!doc) {
+          joiningUpdates.current.get(payload.docId)?.push(payload);
+          return;
+        }
+        // Our own work coming back is already in this copy; only the separate
+        // acknowledgement moves the state machine on.
+        if (isMine(payload.source, doc)) return;
+        // After a reject's answer, updates build on text this copy lacks.
+        if (resyncing.current.has(payload.docId) && doc.settled) return;
+        try {
+          const onScreen = payload.docId === docId.current;
+          // Typing not yet sent goes into the document first, so the update is
+          // transformed against it like any other local work, and the buffer
+          // still holds exactly what the document was made from.
+          if (onScreen) sendTypingRef.current(payload.docId);
+          const baseContent = doc.text;
+          const { text, applied } = proofOf(doc).remote(doc, payload.ops, payload.version);
+          shiftAnchors(payload.docId, applied, payload.suggestedBy ?? null);
+          // A document being drained still has to apply this, or its own
+          // outstanding operation is transformed against the wrong history.
+          // Nobody is looking at it, so nothing is drawn.
+          if (onScreen) deliverRemoteText(payload.docId, text, baseContent, { ops: applied, carryTyping: true });
+        } catch (reason) {
+          dropDocument(payload.docId, toMessage(reason));
+          callbacks.current.onNotice(driftNotice());
+        }
+      }
+    }
+  }), [
+    deliverRemoteText, dropDocument, fail, flush, noteDocumentTree, onReviewEvent, publishLivePaths, publishUnacknowledged,
+    releaseIfDone, resyncIfDue, setDetail, shiftAnchors, stopAfterDisconnect,
+  ]);
+
+  // ---- connection ---------------------------------------------------------
+
+  useOverleafRealtimeConnection({
+    store, enabled: options.enabled, projectRoot: options.projectRoot, projectPermission, callbacksRef: callbacks,
+    publicIdRef: publicId, connectionRootRef: connectionRoot, uncertainRef: uncertain, reconcileUnknownRef, requestReconnectRef,
+    noteDocumentTree, noteProject, stopEverything,
+  });
+
+  // ---- the open file ------------------------------------------------------
+
+  // Resolved here rather than inside the effect so the effect can depend on
+  // the document id itself. `docs` is replaced wholesale every time anyone in
+  // the project creates, renames, moves or deletes anything, and depending on
+  // the map meant an unrelated file appearing would leave and re-join the
+  // document being typed in — replacing the buffer with the server's copy and
+  // taking every keystroke not yet acknowledged with it.
+  const activeDocId = options.activeFile ? docs.get(options.activeFile) ?? null : null;
+
+  useEffect(() => {
+    stopDocument();
+    // Only text documents Overleaf tracks can be edited live; anything else
+    // (figures, files added since we joined) keeps going through syncing.
+    const id = activeDocId;
+    if (!options.documents || status !== "live" || !options.activeFile || !id) return;
+    if (suspendedPaths.current.has(options.activeFile)) return;
+    const activeFile = options.activeFile;
+    let cancelled = false;
+    const pendingUpdates: DocUpdateEvent[] = [];
+    const pendingByDocument = joiningUpdates.current;
+    pendingByDocument.set(id, pendingUpdates);
+    // Coming back to a document that was still draining: it is being edited
+    // again, so the timer that would have given up its room has to go, or it
+    // would fire in the middle of typing.
+    cancelDrain(id);
+    // A document we still hold is one we were editing a moment ago. Asking to
+    // resume from its version makes the server replay what it did meanwhile
+    // instead of only stating where it ended up, which is the difference
+    // between keeping work that never reached it and overwriting it.
+    const current = documents.current.get(id);
+    const resync = resyncing.current.has(id) && current?.settled === true;
+    const fullJoin = forceFullJoin.current || resync;
+    forceFullJoin.current = false;
+    // Lands over the stale copy the editor shows; typing since goes to regular sync's merge.
+    const replacedText = resync ? current.text : null;
+    let held = fullJoin ? undefined : current;
+    let parkedAt: number | undefined;
+    if (fullJoin) proofs.current.unpark(id);
+    const joiningRoot = connectionRoot.current;
+    if (!joiningRoot) {
+      setDetail(i18n._(msg`The Overleaf project connection is no longer active.`));
+      return;
+    }
+    const receipt = crypto.randomUUID();
+    const pauseUnproven = ([reason, message]: [string, string]) => {
+      markOutcomeUnknown(id, reason);
+      setDetail(message);
+    };
+    void (async () => {
+      const pendingLeave = leaving.current.get(id);
+      if (pendingLeave) {
+        if (!await pendingLeave) throw new Error(i18n._(msg`The previous Overleaf document could not be released. Syncing remains paused.`));
+        held = undefined;
+      }
+      parkedAt = held || fullJoin ? undefined : proofs.current.parkedAt(id);
+      // A copy a reject left stale stays blocked: keep re-reading while it is open.
+      return retrying(() => (cancelled ? Promise.resolve(null) : invoke<JoinedDoc>("overleaf_rt_join_doc", {
+        projectRoot: joiningRoot, docId: id, fromVersion: held?.version ?? parkedAt ?? null, receipt,
+      })), RESYNC_RETRY_MS, (reason) => {
+        if (resync && !cancelled) setDetail(String(reason));
+        return resync && !cancelled;
+      });
+    })().then((joined) => {
+      if (!joined) return;
+      if (cancelled) {
+        // Joined after the writer moved on. Leave, or the room stays
+        // subscribed for the rest of the session. A replacement join for the
+        // same document owns that room now, so the stale attempt must not
+        // unsubscribe it.
+        if (!documents.current.has(id) && !joiningUpdates.current.has(id)) {
+          void invoke("overleaf_rt_leave_doc", { projectRoot: joiningRoot, docId: id, receipt, checkpoint: null }).catch(() => {});
+        }
+        return;
+      }
+      let text = joined.text;
+      const heldProof = held && proofOf(held);
+      if (heldProof) heldProof.receipt = receipt;
+      if (held && !held.settled && !joined.resumed) {
+        pauseUnproven(unprovenJoin("noReplay", activeFile));
+        return;
+      }
+      // Settled: once everything typed in it was acknowledged, the local
+      // copy's text is a text Overleaf's grew from too.
+      const heldShared = held && !joined.resumed && held.settled ? heldProof?.localCopy(held)?.text ?? null : null;
+      const resumedLeft = parkedAt === undefined ? null : proofs.current.resume(id, joined, publicId.current, receipt);
+      if (held && joined.resumed) {
+        const caughtUp = joined.caughtUp ?? [];
+        if (held.waiting && !publicId.current && caughtUp.length) {
+          pauseUnproven(unprovenJoin("noPublicId", activeFile));
+          return;
+        }
+        // Classified before replaying: an acknowledgement in the replay
+        // forgets which connections carried the operation it answers.
+        const sawOurUpdate = caughtUp.some((update) => isMine(update.source, held));
+        const result = proofOf(held).replay(held, caughtUp, publicId.current, resyncing.current.has(id));
+        text = result.text;
+        if (result.send) void flush(id, result.send);
+        else resendAfterReplay(id, held);
+        if (held.settled || sawOurUpdate) uncertain.current.delete(id);
+      } else if (resumedLeft) {
+        documents.current.set(id, resumedLeft);
+        text = resumedLeft.text;
+      } else {
+        // Either the first time here, or the server would not reach back far
+        // enough. Its copy is the only thing both sides agree on.
+        const doc = held ?? new OtDocument(joined.text, joined.version);
+        doc.reset(joined.text, joined.version);
+        proofs.current.start(doc, receipt);
+        documents.current.set(id, doc);
+        uncertain.current.delete(id);
+        resyncing.current.delete(id);
+      }
+      // Joining the socket room and returning its snapshot cross an async IPC
+      // boundary. Updates can arrive in between; replay them over the snapshot
+      // instead of silently leaving the local buffer one version behind.
+      const ownsBuffer = pendingByDocument.get(id) === pendingUpdates;
+      const buffered = ownsBuffer ? pendingUpdates.splice(0) : [];
+      if (ownsBuffer) pendingByDocument.delete(id);
+      const joinedDocument = documents.current.get(id);
+      const bufferedApplied: [OtOp[], Suggester | null][] = [];
+      if (joinedDocument) {
+        buffered.sort((left, right) => left.version - right.version);
+        try {
+          for (const update of buffered) {
+            const result = proofOf(joinedDocument).remote(joinedDocument, update.ops, update.version);
+            text = result.text;
+            if (result.applied.length) bufferedApplied.push([result.applied, update.suggestedBy ?? null]);
+          }
+        } catch (reason) {
+          const message = toMessage(reason);
+          if (joinedDocument.settled) dropDocument(id, message);
+          else markOutcomeUnknown(id, message);
+          setDetail(message);
+          callbacks.current.onNotice(i18n._(msg`This document drifted while live editing started, so Lattice stopped joining it. Syncing will reconcile it.`));
+          return;
+        }
+      }
+      publishLivePaths();
+      docId.current = id;
+      publishUnacknowledged();
+      setOpenDoc({ id, comments: joined.comments ?? [], changes: joined.changes ?? [] });
+      for (const [applied, by] of bufferedApplied) shiftAnchors(id, applied, by);
+      setDetail(null);
+      const resumed = (held && joined.resumed) || resumedLeft;
+      const { base, ...how } = joinDelivery(text, {
+        replacedText, heldShared, agreed: resumed ? null : joined.agreed ?? null,
+        local: resumed && joinedDocument ? proofOf(joinedDocument).localCopy(joinedDocument) : null,
+      });
+      deliverRemoteText(id, text, base, how);
+    }).catch((reason) => {
+      if (!cancelled) setDetail(String(reason));
+    });
+    return () => {
+      cancelled = true;
+      if (pendingByDocument.get(id) === pendingUpdates) pendingByDocument.delete(id);
+    };
+  }, [
+    options.activeFile, options.documents, options.projectRoot, activeDocId, status, reloadNonce,
+    deliverRemoteText, stopDocument, flush, dropDocument, markOutcomeUnknown, publishLivePaths, publishUnacknowledged, setOpenDoc, shiftAnchors,
+    setDetail,
+  ]);
+
+  // ---- local edits and out-of-band operations -------------------------------
+
+  /** Put the typing not yet sent into document `id`, which goes out now unless an earlier operation is still unanswered. */
+  const sendTyping = useCallback((id: string) => {
+    clearSendTimer();
+    const text = unsentText.current;
+    unsentText.current = null;
+    // Read again rather than closing over it: the writer may have moved to
+    // another file in the meantime, and this text belongs to the old one.
+    const current = docId.current === id ? documents.current.get(id) : null;
+    if (text === null || !current) return;
+    const { send, replaced, ops } = proofOf(current).typed(current, text);
+    // Queued behind an answer or not, the text has moved: so have anchors.
+    shiftAnchors(id, ops, suggester());
+    // Typing that changed nothing settles here; anything else waits on its ack.
+    publishUnacknowledged();
+    void flush(id, send);
+    if (replaced) {
+      // Overleaf stores these characters as U+FFFD, and so does the
+      // document now; the editor has to show the same, or the two copies
+      // disagree without anyone being told.
+      noteReplaced();
+      deliverRemoteText(id, current.text, text, { carryTyping: true });
+    }
+  }, [deliverRemoteText, flush, publishUnacknowledged, shiftAnchors, suggester]);
+  useEffect(() => {
+    sendTypingRef.current = sendTyping;
+  }, [sendTyping]);
+
+  /** Feed the editor's current text in; ops go out when it differs. */
+  const pushLocal = useCallback((text: string) => {
+    const id = docId.current;
+    // Resyncing: typing stays in the editor, for the re-join to hand to regular sync.
+    if (!id || !documents.current.has(id) || !canContribute.current || deliveryPending(documents.current.get(id)) || resyncing.current.has(id)) return;
+    // Coalesce keystrokes: one operation per SEND_INTERVAL_MS keeps the
+    // channel quiet without anyone noticing a delay. Held where leaving the
+    // document, or a co-author's operation, can find it, because until it is
+    // sent this text exists nowhere else on this side of the wire.
+    unsentText.current = text;
+    if (!sendTimer.current) {
+      sendTimer.current = setTimeout(() => {
+        sendTimer.current = null;
+        sendTyping(id);
+      }, SEND_INTERVAL_MS);
+    }
+    publishUnacknowledged();
+  }, [publishUnacknowledged, sendTyping]);
+
+  /**
+   * Anchor a new comment thread to a span of the open document. Resolves once
+   * Overleaf has it; rejects when the document is not live or an edit is still
+   * in flight, which the caller should report rather than swallow.
+   */
+  const anchorComment = useCallback(async (target: OverleafCommentTarget, threadId: string, position: number, quote: string) => {
+    const doc = documents.current.get(target.docId);
+    if (
+      !doc
+      || docId.current !== target.docId
+      || connectionRoot.current !== target.projectRoot
+      || callbacks.current.activeFile !== target.path
+      || deliveryPending(doc)
+      || resyncing.current.has(target.docId)
+    ) {
+      throw new Error(t`The commented file is no longer open live with Overleaf. Try again.`);
+    }
+    // An anchor is an operation like any other, so it needs the wire to
+    // itself; typing while one is outstanding would be built on a version the
+    // server has not confirmed.
+    const reserved = doc.anchor();
+    if (!reserved) throw new Error(t`An edit is still on its way to Overleaf. Try again in a moment.`);
+    doc.noteSubmitted(publicId.current);
+    publishUnacknowledged();
+    try {
+      await invoke("overleaf_rt_send_comment", {
+        projectRoot: target.projectRoot, docId: target.docId, version: reserved.version, position, quote, threadId,
+      });
+    } catch (reason) {
+      // A lost answer (say a 10 s ack timeout) is an unknown outcome like any
+      // other send's: replay it, never fail the connection over it.
+      if (documents.current.get(target.docId)?.waiting) markOutcomeUnknown(target.docId, reason);
+      throw reason;
+    }
+    // Show it straight away rather than waiting for the round trip.
+    patchOpenDoc(target.docId, (current) => ({ comments: [...current.comments, { threadId, position, quote }] }));
+  }, [markOutcomeUnknown, patchOpenDoc, publishUnacknowledged, t]);
+
+  return {
+    status,
+    detail: options.documents && status === "live" && options.activeFile && !activeDocId
+      ? t`Overleaf doesn’t support live editing for this file, so it will use regular sync.`
+      // Often a host error verbatim, so shown in the interface language.
+      : detail && hostErrorText(detail),
+    /** True when the open file is being edited through the live channel. */
+    liveFile,
+    /**
+     * True while the open file holds local work Overleaf has not acknowledged
+     * (typed, sent, queued, or of unknown outcome): live, but not yet synced.
+     */
+    unacknowledged,
+    /**
+     * Every path still owned by the live channel, including a file that is no
+     * longer open but is waiting for an acknowledgement. Ordinary syncing must
+     * skip all of them: an acknowledgement can arrive after the writer switches
+     * tabs, and uploading the same bytes meanwhile would be an out-of-band
+     * overwrite.
+     */
+    livePaths,
+    /** Overleaf's id for the open document, when it has one. */
+    docId: openDoc?.id ?? null,
+    permission,
+    canWrite,
+    /** Everything in the project by path, with the id its endpoints take (deleting a file needs it). */
+    entities,
+    /** Comment anchors in the open document, as Overleaf holds them. */
+    comments: openDoc?.comments ?? EMPTY_COMMENTS,
+    /** Suggestions in the open document. */
+    changes: openDoc?.changes ?? EMPTY_CHANGES,
+    /**
+     * Take the wire for an operation this hook does not build itself — the
+     * inverse operations that reject a suggestion — and answer with the version
+     * to send it at. Null when the document is not live or one of our own
+     * operations is unacknowledged: the server numbers versions, so a second
+     * operation built on an unconfirmed one would apply against the wrong history.
+     */
+    reserveOperation: (): ReservedOperation | null => {
+      const id = docId.current;
+      const doc = openDocument();
+      // Unsent typing would leave on the copy the reject makes stale.
+      if (typingUnsent() || deliveryPending(doc) || (id && resyncing.current.has(id))) return null;
+      const anchor = doc?.anchor();
+      if (!id || !doc || !anchor) return null;
+      doc.noteSubmitted(publicId.current);
+      // Rejection sends real inverse text ops outside OtDocument, although
+      // its reservation is empty. Keep the checkpoint proven so far but never
+      // claim this model is current again until a full reset and guarded delivery.
+      proofOf(doc).invalidate(doc);
+      resyncing.current.add(id);
+      publishUnacknowledged();
+      return { docId: id, version: anchor.version };
+    },
+    /** A reserved operation failed without proving whether the server committed it: reconcile by replay. */
+    noteReservedOperationUnknown: (reservation: ReservedOperation, reason: unknown) => {
+      if (documents.current.get(reservation.docId)?.waiting) markOutcomeUnknown(reservation.docId, reason);
+    },
+    /** The server version when the open document has nothing local in flight; unlike `reserveOperation`, keeps the wire free. */
+    settledVersion: () => {
+      const doc = openDocument();
+      // Treating typing not yet sent as settled would let a REST mutation reload
+      // the server copy over those keystrokes.
+      if (typingUnsent() || deliveryPending(doc) || resyncing.current.has(docId.current ?? "")) return null;
+      return doc?.settled ? doc.version : null;
+    },
+    /** Re-read the open document, after accepting or rejecting a suggestion. */
+    reload: () => {
+      const id = docId.current;
+      const doc = openDocument();
+      // A reject's re-join is owed; it starts once Overleaf answers.
+      if (id && resyncing.current.has(id)) {
+        resyncIfDue(id);
+        return;
+      }
+      if (typingUnsent() || (doc && !doc.settled) || deliveryPending(doc)) {
+        setDetail(i18n._(msg`A local edit has not settled on Overleaf yet, so this document cannot be reloaded safely.`));
+        if (id && uncertain.current.has(id)) reconcileUnknownRef.current(id);
+        return;
+      }
+      // Start over from the server's copy rather than resuming from ours:
+      // reload follows a change no operation describes — a suggestion
+      // accepted, or rejected by an operation we never applied here — so our
+      // copy is exactly what cannot be trusted.
+      forceFullJoin.current = true;
+      bumpReloadNonce();
+    },
+    pushLocal,
+    suspendPaths,
+    resumePaths,
+    anchorComment,
+  };
+}
+
+const increment = (count: number) => count + 1;

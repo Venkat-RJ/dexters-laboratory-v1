@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "topics": [
+    {
+      "id": "question",
+      "label": "Research question: not yet formulated",
+      "depth": 0
+    },
+    {
+      "id": "prior",
+      "label": "Prior knowledge: not yet reviewed",
+      "depth": 1
+    },
+    {
+      "id": "ideas",
+      "label": "Experiment ideas: not yet proposed",
+      "depth": 1
+    },
+    {
+      "id": "baseline",
+      "label": "Setup and baseline: not yet checked",
+      "depth": 1
+    },
+    {
+      "id": "findings",
+      "label": "Findings: no results yet",
+      "depth": 1
+    }
+  ]
+}

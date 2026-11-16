@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Mind Map"
+  short_description: "Connect questions, evidence, hypotheses and tests"
+  default_prompt: "Use $research-mind-map to map the current research question and evidence."

@@ -1,0 +1,268 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useLingui } from "@lingui/react/macro";
+import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { localPdfPath, paperPdfUrl, type PaperSourceCitation } from "../papers/paper-source";
+import { readProjectPdfBytes } from "../pdf/project-pdf";
+import { sourceQuoteDomRange } from "../papers/source-quote";
+import type { PdfSourceQuote } from "../pdf/pdf-viewer";
+import { notifyError } from "../telemetry/app-notify";
+import { paperPdfReading } from "../papers/paper-pdf-reading";
+import type { CanvasMode, PaperSourceRequest, PaperSummary, VisualMarkdownViewState } from "../app-types";
+import { toMessage } from "../app-utils";
+import { loadPdfPreviewModule, loadPdfQuotePageModule } from "./canvas-lazy-modules";
+import { capturePreviewViewport } from "./markdown-preview-sync";
+
+/**
+ * An original PDF a Paper links to. `generic` sources are fetched through the
+ * backend rather than opened directly; a `local` one is the PDF the Paper's
+ * bundle keeps (a Zotero attachment), read from the project by its path.
+ */
+type PaperPdfSource = { key: string; url: string; fileName: string; generic: boolean; local?: boolean };
+
+type PaperPdfView = PaperPdfSource & {
+  bytes: ArrayBuffer | null;
+  previewUrl: string | null;
+  error: boolean;
+  initialPage: number;
+  quote: PdfSourceQuote | null;
+};
+
+type PaperLink = Pick<PaperSummary, "arxivId" | "url" | "hasLocalPdf">;
+
+/** `value` as an http(s) URL; anything malformed or unsafe to hand the OS opener is null. */
+function httpUrl(value: string | null | undefined): URL | null {
+  try {
+    const parsed = new URL(value ?? "");
+    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function paperPdfSource(paper: PaperLink): PaperPdfSource | null {
+  // The pages the writer read and annotated, before any copy on the web.
+  if (paper.hasLocalPdf) {
+    const path = localPdfPath(paper);
+    return { key: path, url: path, fileName: "original.pdf", generic: false, local: true };
+  }
+  // With no URL beside it, paperPdfUrl answers only for a well-formed arXiv id.
+  const arxivId = paper.arxivId.trim();
+  const arxivUrl = paperPdfUrl({ arxivId });
+  if (arxivUrl) return { key: arxivUrl, url: arxivUrl, fileName: `${arxivId.replace("/", "-")}.pdf`, generic: false };
+  const parsed = httpUrl(paperPdfUrl(paper));
+  if (!parsed?.pathname.toLocaleLowerCase().endsWith(".pdf")) return null;
+  let fileName = parsed.pathname.split("/").at(-1) || "paper.pdf";
+  try {
+    fileName = decodeURIComponent(fileName);
+  } catch {
+    // A malformed escape in the display name must not make an otherwise safe PDF URL unusable.
+  }
+  return { key: parsed.href, url: parsed.href, fileName, generic: true };
+}
+
+function paperBrowserUrl(paper: Pick<PaperSummary, "arxivId" | "url">): string | null {
+  return paperPdfUrl(paper) || httpUrl(paper.url)?.href || null;
+}
+
+type PaperQuoteFallback = { paperId: string; path: string; returnPath: string; quote: PdfSourceQuote };
+
+/**
+ * The Paper reader's alternate PDF surface: the open Paper's original PDF, the
+ * one view of it shown (bytes cached for a quick return), and the fallback into
+ * the full-text Markdown when a quoted source cannot be shown in the PDF.
+ */
+export function usePaperPdf({
+  activePaper, activeFile, mode, onOpenMarkdownPath, flushVisualMarkdown, previewViewportRef, settledPreviewText,
+  sourceRequest, onSourceRequestHandled,
+}: {
+  activePaper: PaperSummary | null;
+  activeFile: string;
+  mode: CanvasMode;
+  onOpenMarkdownPath: (path: string) => void;
+  /** Publishes the visual editor's pending edit; false means it cannot yet. */
+  flushVisualMarkdown: () => boolean | undefined;
+  previewViewportRef: RefObject<HTMLDivElement | null>;
+  settledPreviewText: string;
+  /** A source link or cited page followed from elsewhere, for whichever Paper it names. */
+  sourceRequest: PaperSourceRequest | null;
+  onSourceRequestHandled: (id: string) => void;
+}) {
+  const { t } = useLingui();
+  const activePaperId = activePaper?.arxivId;
+  const activePaperUrl = activePaper?.url;
+  const activePaperLocalPdf = activePaper?.hasLocalPdf;
+  const { pdfSource, browserUrl } = useMemo(() => {
+    const paper = activePaperId !== undefined ? { arxivId: activePaperId, url: activePaperUrl, hasLocalPdf: activePaperLocalPdf } : null;
+    return { pdfSource: paper && paperPdfSource(paper), browserUrl: paper && paperBrowserUrl(paper) };
+  }, [activePaperId, activePaperLocalPdf, activePaperUrl]);
+  const [pdfView, setPdfView] = useState<PaperPdfView | null>(null);
+  const [quoteFallback, setQuoteFallback] = useState<PaperQuoteFallback | null>(null);
+  const returnViewportRef = useRef<VisualMarkdownViewState & { path: string } | null>(null);
+  const pagesRef = useRef(new Map<string, number>());
+  // Retain only the last complete PDF, not an unbounded library of buffers.
+  // PdfPreview copies bytes before transferring them to its worker.
+  const bytesRef = useRef<{ key: string; bytes: ArrayBuffer } | null>(null);
+  const requestRef = useRef(0);
+  useEffect(() => {
+    returnViewportRef.current = null;
+  }, [activePaperId]);
+  useEffect(() => {
+    requestRef.current += 1;
+    setQuoteFallback((current) => current?.paperId === activePaperId ? current : null);
+    setPdfView((current) => current?.key === pdfSource?.key ? current : null);
+    // Start the viewer chunk now so a later PDF click waits only for the remote source.
+    if (pdfSource) void loadPdfPreviewModule();
+  }, [activePaperId, pdfSource]);
+  const closePdf = useCallback(() => {
+    requestRef.current += 1;
+    setPdfView(null);
+  }, []);
+  // Blog/Paper and Edit/Split/Preview remain the owners of Markdown state.
+  // Choosing one while the PDF is open exits the alternate PDF surface (and
+  // App marks the Paper as read as text again). Another document coming in
+  // front only leaves the PDF: a Paper read as its PDF keeps it set aside
+  // (papers/paper-pdf-reading.ts), and opens it again when it is back (below).
+  useEffect(() => closePdf(), [activeFile, closePdf, mode]);
+  useEffect(() => {
+    const viewport = previewViewportRef.current;
+    if (!quoteFallback || quoteFallback.paperId !== activePaperId || quoteFallback.path !== activeFile || !viewport) return;
+    let frame = 0;
+    const locate = () => {
+      const root = viewport.querySelector<HTMLElement>(".ProseMirror") ?? viewport;
+      const range = sourceQuoteDomRange(root, quoteFallback.quote.first, quoteFallback.quote.last);
+      if (!range) return;
+      // Disconnecting also drops queued records, so a match runs this at most once.
+      observer.disconnect();
+      frame = requestAnimationFrame(() => {
+        range.startContainer.parentElement?.scrollIntoView({ block: "center" });
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      });
+    };
+    const observer = new MutationObserver(locate);
+    observer.observe(viewport, { subtree: true, childList: true, characterData: true });
+    locate();
+    return () => { observer.disconnect(); cancelAnimationFrame(frame); };
+  }, [activeFile, activePaperId, previewViewportRef, quoteFallback, settledPreviewText]);
+
+  const updateView = useCallback((key: string, update: Partial<PaperPdfView>) => {
+    setPdfView((current) => current?.key === key ? { ...current, ...update } : current);
+  }, []);
+  const fallbackToQuote = useCallback((quote: PdfSourceQuote | null | undefined) => {
+    if (!quote || !activePaper?.hasFullText) return;
+    const path = `.research/papers/${activePaper.arxivId}/paper.md`;
+    setQuoteFallback({ paperId: activePaper.arxivId, path, returnPath: activeFile, quote });
+    setPdfView(null);
+    paperPdfReading.set(activePaper.arxivId, null);
+    onOpenMarkdownPath(path);
+  }, [activeFile, activePaper, onOpenMarkdownPath]);
+  const openPdf = useCallback((quote: PdfSourceQuote | null = null) => {
+    if (!pdfSource) return;
+    if (flushVisualMarkdown() === false) return;
+    const viewport = previewViewportRef.current;
+    if (viewport) returnViewportRef.current = { path: activeFile, ...capturePreviewViewport(viewport) };
+    const request = ++requestRef.current;
+    if (activePaperId) paperPdfReading.set(activePaperId, { ...pdfSource, path: activeFile });
+    const cached = bytesRef.current;
+    const bytes = cached?.key === pdfSource.key ? cached.bytes : null;
+    setPdfView({
+      ...pdfSource,
+      bytes,
+      previewUrl: pdfSource.generic || pdfSource.local || bytes ? null : pdfSource.url,
+      error: false,
+      initialPage: quote?.page ?? pagesRef.current.get(pdfSource.key) ?? 1,
+      quote,
+    });
+    if (bytes) return;
+    if (pdfSource.local) {
+      void readProjectPdfBytes(pdfSource.url).then((read) => {
+        if (requestRef.current !== request) return;
+        bytesRef.current = { key: pdfSource.key, bytes: read };
+        updateView(pdfSource.key, { bytes: read });
+      }).catch(() => {
+        if (requestRef.current !== request) return;
+        updateView(pdfSource.key, { error: true });
+        fallbackToQuote(quote);
+      });
+      return;
+    }
+    if (!pdfSource.generic) return;
+    void invoke<string>("paper_pdf_preview_url", { url: pdfSource.url }).then((previewUrl) => {
+      if (requestRef.current === request) updateView(pdfSource.key, { previewUrl });
+    }).catch(() => {
+      if (requestRef.current !== request) return;
+      updateView(pdfSource.key, { error: true });
+      fallbackToQuote(quote);
+    });
+  }, [activeFile, activePaperId, fallbackToQuote, flushVisualMarkdown, pdfSource, previewViewportRef, updateView]);
+  // Answered once its Paper is in front, after the effects above, so the PDF
+  // this opens is not closed again by the open's own file change.
+  // On the next frame, once the Paper's own first render has painted.
+  // With no request, a Paper read as its PDF when another document came in
+  // front (or kept beside one) shows its PDF again as it comes back. One
+  // effect for both keeps the documents' startup renders to the hooks they
+  // had (perf-bench counts them).
+  useEffect(() => {
+    if (!sourceRequest && activePaperId && pdfSource && pdfView?.key !== pdfSource.key
+      && paperPdfReading.get(activePaperId)?.key === pdfSource.key) {
+      openPdf();
+      return;
+    }
+    if (!sourceRequest || !activePaperId || sourceRequest.arxivId !== activePaperId) return;
+    const frame = requestAnimationFrame(() => {
+      onSourceRequestHandled(sourceRequest.id);
+      const { arxivId: _paper, ...quote } = sourceRequest;
+      if (pdfSource) openPdf(quote);
+      // Without a PDF, the passage is still found in the full text; a page alone has nowhere to go.
+      else if (quote.first) fallbackToQuote(quote);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activePaperId, fallbackToQuote, onSourceRequestHandled, openPdf, pdfSource, pdfView, sourceRequest]);
+  const capturePdf = useCallback((bytes: ArrayBuffer) => {
+    if (!pdfSource) return;
+    bytesRef.current = { key: pdfSource.key, bytes };
+    updateView(pdfSource.key, { bytes });
+  }, [pdfSource, updateView]);
+  /**
+   * Where `quote`, read in the full text, sits in the original PDF: its page
+   * and anchors there, or null when the PDF does not hold it once. The PDF
+   * read for it is kept, so viewing it next does not fetch it again.
+   */
+  const locateQuote = useCallback(async (quote: string): Promise<PaperSourceCitation | null> => {
+    if (!pdfSource) return null;
+    const cached = bytesRef.current?.key === pdfSource.key ? bytesRef.current.bytes : null;
+    const source = cached ? { data: cached }
+      : pdfSource.local ? { data: await readProjectPdfBytes(pdfSource.url) }
+      : { url: pdfSource.generic ? await invoke<string>("paper_pdf_preview_url", { url: pdfSource.url }) : pdfSource.url };
+    const { place, bytes } = await (await loadPdfQuotePageModule()).findQuotePage(source, quote);
+    if (!cached) bytesRef.current = { key: pdfSource.key, bytes };
+    return place;
+  }, [pdfSource]);
+  const rememberPage = useCallback((page: number) => {
+    if (pdfSource) pagesRef.current.set(pdfSource.key, page);
+  }, [pdfSource]);
+  const openInBrowser = useCallback(() => {
+    if (!browserUrl) return;
+    void openUrl(browserUrl).catch((reason) => {
+      notifyError(t`Papers`, t`Could not open the article in your browser`, { detail: toMessage(reason) });
+    });
+  }, [browserUrl, t]);
+
+  return {
+    pdfSource,
+    browserUrl,
+    pdfView: activePaper && pdfView && pdfView.key === pdfSource?.key ? pdfView : null,
+    quoteFallback,
+    /** Where the reader came from before a quote fell back into this full text, while it is shown. */
+    quoteReturnPath: quoteFallback?.paperId === activePaperId && quoteFallback?.path === activeFile ? quoteFallback.returnPath : null,
+    clearQuoteFallback: () => setQuoteFallback(null),
+    // The writer's own way back to the text: the Paper is read as text again.
+    closePdf: () => {
+      closePdf();
+      if (activePaperId) paperPdfReading.set(activePaperId, null);
+    },
+    returnViewportRef, openPdf, capturePdf, rememberPage, fallbackToQuote, openInBrowser, locateQuote,
+  };
+}

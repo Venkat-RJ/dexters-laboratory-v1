@@ -1,0 +1,828 @@
+//! One window's link to Overleaf (`use-overleaf-workspace.ts`,
+//! `overleaf-live-poll.ts`): whether the open project is linked and may sync
+//! with the signed-in account, its syncs (asked for, and in live mode on
+//! their own), the channel that joins the project, manual mode's badge, and
+//! what a finished sync leaves the writer to know or do.
+//!
+//! - Live mode asks Overleaf every 3 s whether its history moved (a small
+//!   JSON probe) and syncs only on a yes, no more than once per 12 s; once
+//!   the channel carries documents, only figures and new files are left to
+//!   it, so it asks every 45 s and syncs at most every 30 s. Without a
+//!   version to compare it syncs every two minutes; a 429 backs it off
+//!   sharply. A window off screen rests (unless work of ours is owed), and
+//!   coming back to it asks at once. A change here (a save, an outside
+//!   edit) syncs after 2.5 s of quiet, once a probe that also reads the
+//!   files here says something differs, so a build's outputs or a sync's
+//!   own writes never cost a project download.
+//! - A board, sheet or deck (whole-file editors, whose every edit rewrites
+//!   the file) waits while it is being edited: it goes up once the writer
+//!   leaves it, the window loses focus, ⌘S saves, or it has sat a minute
+//!   (`OVERLEAF_WHOLE_FILE_*` in `use-overleaf-workspace.ts`).
+//! - Manual mode never syncs on its own: it probes every 30 s and badges the
+//!   toolbar's button when Overleaf has work this project has not pulled.
+//! - A sync's files changed on disk reach the editors, the tree and the PDF
+//!   through the project's watcher, as any outside edit does; the bridge
+//!   tells the window to build, opens the conflict resolver on a file left
+//!   marked up, and records a version when something moved.
+
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use futures::channel::{mpsc, oneshot};
+use gpui::{App, AppContext as _, Context, EventEmitter, SharedString, Subscription, Task};
+use lattice_core::{
+    overleaf::{OverleafLink, OverleafStatus, OverleafSyncResult},
+    overleaf_rt::{RealtimeClient, RealtimeEvent},
+};
+use lattice_i18n::t;
+use lattice_settings::OverleafSyncMode;
+use lattice_ui::components::ToastLevel;
+
+pub use super::channel::ChannelStatus;
+use super::{
+    channel::{self, ChannelNews},
+    outcome, remote_deletes, sync,
+};
+use crate::notices::{self, Notice, NoticeAction};
+
+mod chat;
+mod documents;
+pub use documents::OverleafSaveState;
+mod finished;
+mod live;
+mod presence;
+mod review;
+#[allow(unused_imports)]
+pub use review::DocReview;
+
+/// How often live mode asks Overleaf whether anything changed.
+const LIVE_POLL: Duration = Duration::from_secs(3);
+/// Cadence when Overleaf gives no cheap way to detect a change.
+const BLIND_POLL: Duration = Duration::from_secs(120);
+/// Cadence once the channel carries documents: only figures and new files
+/// remain, and each "yes" is a full download.
+const CHANNEL_POLL: Duration = Duration::from_secs(45);
+/// Floor between automatic syncs: Overleaf answers 429 past ten project
+/// downloads a minute, and a collaborator typing moves the version on every
+/// poll.
+const MIN_SYNC_GAP: Duration = Duration::from_secs(12);
+/// The floor once the channel carries documents.
+const CHANNEL_SYNC_GAP: Duration = Duration::from_secs(30);
+/// A whole-file editor just left: its cleanup writes settle first.
+const WHOLE_FILE_SETTLE: Duration = Duration::from_secs(1);
+/// A long quiet edit in a whole-file editor still gets a checkpoint on
+/// Overleaf.
+const WHOLE_FILE_IDLE: Duration = Duration::from_secs(60);
+/// Quiet time after a change here before it is pushed up.
+const PUSH_DEBOUNCE: Duration = Duration::from_millis(2_500);
+/// How often manual mode checks for work on Overleaf.
+const BADGE_POLL: Duration = Duration::from_secs(30);
+/// The notice a sync's outcome replaces, one per window's project.
+const SYNC_KEY: &str = "overleaf-sync";
+
+/// The project's link, and whether the signed-in session may use it.
+#[derive(Clone, Debug)]
+pub struct LinkFor {
+    pub link: OverleafLink,
+    /// Signed in to the link's host, and not paused.
+    pub active: bool,
+}
+
+/// Whether two Overleaf hosts are the same server (`overleafHostsMatch`).
+pub fn hosts_match(left: &str, right: &str) -> bool {
+    let canonical = |value: &str| {
+        let trimmed = value.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let lower = trimmed.to_lowercase();
+        let rest = lower
+            .strip_prefix("https://")
+            .map(|rest| ("https:", rest))
+            .or_else(|| lower.strip_prefix("http://").map(|rest| ("http:", rest)))
+            .unwrap_or(("https:", lower.as_str()));
+        let host = rest.1.split(['/', '?', '#']).next().unwrap_or_default();
+        format!("{}//{host}", rest.0)
+    };
+    canonical(left) == canonical(right)
+}
+
+/// A link with no host of its own uses the session's
+/// (`overleafLinkMatchesSession`).
+pub fn link_matches_session(session_host: &str, link_host: &str) -> bool {
+    link_host.trim().is_empty() || hosts_match(session_host, link_host)
+}
+
+/// The project's page on Overleaf, in the browser.
+pub fn open_on_overleaf(link: &OverleafLink, cx: &mut App) {
+    let host = link.host.trim().trim_end_matches('/');
+    if host.is_empty() {
+        notices::error(
+            t!("Could not open the project because its Overleaf host is invalid."),
+            "",
+            cx,
+        );
+        return;
+    }
+    let id: String = link
+        .project_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    cx.open_url(&format!("{host}/project/{id}"));
+}
+
+/// What the bridge tells the window.
+pub enum OverleafBridgeEvent {
+    /// A sync brought files in (or deleted some): the PDF should follow.
+    Incoming,
+    /// A file a sync left marked up: open the resolver on it.
+    OpenConflict(String),
+    /// The session ended: Settings › Overleaf is where to sign in again.
+    OpenSettings,
+    /// Who is in the project, or where they are, changed.
+    PresenceChanged,
+}
+
+#[derive(Clone, Default)]
+pub struct SyncOptions {
+    /// Live mode's own sync, rather than one the writer asked for.
+    pub automatic: bool,
+    /// The version a probe just saw, so the sync can skip the download when
+    /// nothing moved past it.
+    pub observed_remote_version: Option<i64>,
+    /// Whole-file documents still being edited that this automatic sync may
+    /// take up all the same (they are ready to go).
+    pub include_whole_files: BTreeSet<String>,
+}
+
+pub struct OverleafBridge {
+    root: Option<PathBuf>,
+    /// The project's link, read for `root`.
+    link: Option<LinkFor>,
+    /// The account's session as last read.
+    status: Option<OverleafStatus>,
+    /// Bumped by every read of the link, so a late answer is dropped.
+    link_generation: u64,
+    session_seen: u64,
+    mode: OverleafSyncMode,
+    syncing: bool,
+    /// Manual mode's badge: Overleaf has work this project has not pulled.
+    remote_changes: bool,
+    channel: ChannelStatus,
+    channel_detail: Option<SharedString>,
+    /// The channel failure last toasted, until the channel joins again.
+    toasted_failure: Option<String>,
+    /// A sync already rejoined the failed channel once since it last joined.
+    rejoined: bool,
+    /// Every file's Overleaf id and kind by path, from the channel.
+    entities: HashMap<String, (String, String)>,
+    entity_list: Option<Vec<lattice_core::overleaf_rt::EntityEntry>>,
+    /// A change here waits to be pushed.
+    local_pending: bool,
+    /// A sync failed in transit and is owed again.
+    transport_retry: bool,
+    /// Syncs Overleaf refused in a row while the session stayed valid.
+    refusals: u32,
+    last_auto_sync: Option<Instant>,
+    /// Files the writer chose to keep on Overleaf when asked, for the
+    /// session: the safe side of forgetting is a file left on Overleaf.
+    declined_deletes: HashSet<(PathBuf, String)>,
+    sync_task: Option<Task<()>>,
+    /// The running sync's entry in the log.
+    sync_trace: Option<crate::app_log::trace::Trace>,
+    /// Told how the running sync went (Review's Apply).
+    sync_waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    /// Asked to hear how a sync went while another was running: told by the
+    /// sync that starts once it ends, which carries what was saved since.
+    queued_waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    poll_task: Option<Task<()>>,
+    /// Asks the live poll to probe now (the window came forward).
+    poll_wake: Option<mpsc::UnboundedSender<()>>,
+    /// The window is on screen; off it, the live poll rests.
+    window_visible: bool,
+    /// Asks the channel to join now rather than wait out its backoff.
+    channel_retry: Option<mpsc::UnboundedSender<()>>,
+    whole_files: live::WholeFiles,
+    push_task: Option<Task<()>>,
+    badge_task: Option<Task<()>>,
+    channel_task: Option<Task<()>>,
+    link_task: Option<Task<()>>,
+    /// Staged by a scenario (`scenario_stage`): shown as linked and live,
+    /// but nothing reads the link again or asks Overleaf anything.
+    staged: bool,
+    /// The live channel's client while it is up.
+    client: Option<Arc<RealtimeClient>>,
+    presence: presence::PresenceState,
+    documents: documents::DocumentsState,
+    review: review::ReviewState,
+    chat: chat::ChatState,
+    _settings: Subscription,
+}
+
+impl EventEmitter<OverleafBridgeEvent> for OverleafBridge {}
+
+impl OverleafBridge {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let settings = cx.observe_global::<crate::settings::AppSettings>(|this, cx| {
+            let mode = crate::settings::get(cx).overleaf_sync_mode;
+            if mode != this.mode {
+                this.mode = mode;
+                this.apply(cx);
+                this.reconsider_live(cx);
+            }
+        });
+        Self {
+            root: None,
+            link: None,
+            status: None,
+            link_generation: 0,
+            session_seen: super::session_generation(cx),
+            mode: crate::settings::get(cx).overleaf_sync_mode,
+            syncing: false,
+            remote_changes: false,
+            channel: ChannelStatus::Off,
+            channel_detail: None,
+            toasted_failure: None,
+            rejoined: false,
+            entities: HashMap::new(),
+            entity_list: None,
+            local_pending: false,
+            transport_retry: false,
+            refusals: 0,
+            last_auto_sync: None,
+            declined_deletes: HashSet::new(),
+            sync_task: None,
+            sync_trace: None,
+            sync_waiters: Vec::new(),
+            queued_waiters: Vec::new(),
+            poll_task: None,
+            poll_wake: None,
+            window_visible: true,
+            channel_retry: None,
+            whole_files: Default::default(),
+            push_task: None,
+            badge_task: None,
+            channel_task: None,
+            link_task: None,
+            staged: false,
+            client: None,
+            presence: Default::default(),
+            documents: Default::default(),
+            review: Default::default(),
+            chat: Default::default(),
+            _settings: settings,
+        }
+    }
+
+    /// The project's link, while the signed-in session may sync it.
+    pub fn link(&self) -> Option<&OverleafLink> {
+        self.link
+            .as_ref()
+            .filter(|link| link.active)
+            .map(|link| &link.link)
+    }
+
+    /// The project has a link, active or not: a paused one is not offered
+    /// for upload as a second Overleaf project.
+    pub fn linked(&self) -> bool {
+        self.link.is_some()
+    }
+
+    pub fn syncing(&self) -> bool {
+        self.syncing
+    }
+
+    pub fn remote_changes(&self) -> bool {
+        self.remote_changes
+    }
+
+    pub fn mode(&self) -> OverleafSyncMode {
+        self.mode
+    }
+
+    /// The channel's state as the toolbar shows it: off in manual mode,
+    /// where it carries no documents.
+    pub fn channel(&self) -> ChannelStatus {
+        if self.mode == OverleafSyncMode::Live {
+            self.channel
+        } else {
+            ChannelStatus::Off
+        }
+    }
+
+    /// Why the shown file is not live, or what the channel last said.
+    pub fn channel_detail(&self) -> Option<SharedString> {
+        if let Some(detail) = self.documents_detail() {
+            return Some(detail);
+        }
+        // Up and carrying documents, yet the file in front is none of them:
+        // an image, a PDF, a file Overleaf keeps whole.
+        if self.mode == OverleafSyncMode::Live
+            && self.channel == ChannelStatus::Live
+            && self.live_file().is_none()
+            && self.shown_not_live()
+        {
+            return Some(
+                t!("Overleaf doesn’t support live editing for this file, so it will use regular sync.")
+                    .into(),
+            );
+        }
+        self.channel_detail.clone()
+    }
+
+    /// The window came on screen or went off it.
+    pub fn set_window_visible(&mut self, visible: bool) {
+        if std::mem::replace(&mut self.window_visible, visible) != visible && visible {
+            self.window_came_forward();
+        }
+    }
+
+    /// The window became the key window, or stopped being it.
+    pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if active {
+            self.window_came_forward();
+        } else {
+            // Going to the browser is when co-authors look: what waits in a
+            // whole-file editor goes up.
+            self.flush_whole_files_soon(cx);
+        }
+    }
+
+    /// Back from the browser is when stale content is most obvious: probe
+    /// now, and join a channel that is waiting to.
+    fn window_came_forward(&mut self) {
+        if let Some(wake) = &self.poll_wake {
+            wake.unbounded_send(()).ok();
+        }
+        if let Some(retry) = &self.channel_retry {
+            retry.unbounded_send(()).ok();
+        }
+    }
+
+    /// The channel carries documents (it is up, in live mode).
+    fn channel_live(&self) -> bool {
+        self.mode == OverleafSyncMode::Live && self.channel == ChannelStatus::Live
+    }
+
+    /// The window's project changed: nothing queued for one carries over.
+    pub fn set_project(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.root == root {
+            return;
+        }
+        self.root = root;
+        self.link = None;
+        self.remote_changes = false;
+        self.local_pending = false;
+        self.transport_retry = false;
+        self.refusals = 0;
+        self.entities.clear();
+        self.entity_list = None;
+        self.review_reset();
+        self.chat_reset();
+        self.cancel_sync(cx);
+        self.sync_waiters.clear();
+        self.queued_waiters.clear();
+        self.syncing = false;
+        self.toasted_failure = None;
+        self.rejoined = false;
+        self.whole_files = Default::default();
+        self.stop(cx);
+        self.reload_link(cx);
+    }
+
+    /// Stop the loops and the channel.
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        self.poll_task = None;
+        self.poll_wake = None;
+        self.push_task = None;
+        self.badge_task = None;
+        self.channel_task = None;
+        self.channel_retry = None;
+        self.channel = ChannelStatus::Off;
+        self.channel_detail = None;
+        // Closing the project: what is unanswered syncs when it opens again.
+        self.documents_dropped(false, cx);
+        self.client = None;
+        self.presence_dropped(cx);
+        cx.notify();
+    }
+
+    /// Linked to `link`, signed in as `status`, the live channel up, with
+    /// nothing asked of the network: the parity harness's linked project.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn scenario_stage(
+        &mut self,
+        status: OverleafStatus,
+        link: OverleafLink,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop(cx);
+        self.staged = true;
+        self.cancel_sync(cx);
+        self.link_task = None;
+        self.link_generation += 1;
+        self.session_seen = super::session_generation(cx);
+        self.status = Some(status);
+        self.link = Some(LinkFor { link, active: true });
+        self.channel = ChannelStatus::Live;
+        cx.notify();
+    }
+
+    /// Read the project's link and the session again (after a sync, a
+    /// change in Settings, a sign-in or out), then run what it calls for.
+    pub fn reload_link(&mut self, cx: &mut Context<Self>) {
+        if self.staged {
+            return;
+        }
+        self.link_generation += 1;
+        let generation = self.link_generation;
+        let session = super::session_generation(cx);
+        if session != self.session_seen && self.channel == ChannelStatus::Error {
+            self.channel_task = None;
+        }
+        self.session_seen = session;
+        let Some(root) = self.root.clone() else {
+            self.link = None;
+            self.stop(cx);
+            return;
+        };
+        let read = cx.background_spawn(async move {
+            let status = super::account::status().ok();
+            let link = sync::link(&root).ok().flatten();
+            (status, link)
+        });
+        self.link_task = Some(cx.spawn(async move |this, cx| {
+            let (status, link) = read.await;
+            this.update(cx, |this, cx| {
+                if this.link_generation != generation {
+                    return;
+                }
+                let session_host = status.as_ref().map(|s| s.host.clone()).unwrap_or_default();
+                this.link = link.map(|mut link| {
+                    if link.host.trim().is_empty() {
+                        link.host = session_host.clone();
+                    }
+                    let active = status.as_ref().is_some_and(|status| status.connected)
+                        && !link.paused
+                        && link_matches_session(&session_host, &link.host);
+                    LinkFor { link, active }
+                });
+                this.status = status;
+                this.apply(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The session changed somewhere (another window signed in or out, a
+    /// request found it expired): read the link again.
+    pub fn check_session(&mut self, cx: &mut Context<Self>) {
+        if self.staged {
+            return;
+        }
+        if super::session_generation(cx) != self.session_seen {
+            self.reload_link(cx);
+        }
+    }
+
+    /// Start what the link and the mode call for, and stop the rest.
+    fn apply(&mut self, cx: &mut Context<Self>) {
+        if self.staged {
+            return;
+        }
+        let (Some(root), true) = (self.root.clone(), self.link().is_some()) else {
+            self.stop(cx);
+            self.remote_changes = false;
+            return;
+        };
+        // The channel joins in either mode: it is what uploads need.
+        if self.channel_task.is_none() {
+            self.channel = ChannelStatus::Connecting;
+            self.channel_detail = None;
+            let this = cx.entity().downgrade();
+            let (retry, asked) = mpsc::unbounded();
+            self.channel_retry = Some(retry);
+            self.channel_task = Some(channel::hold(root.clone(), this, asked, &cx.to_async()));
+        }
+        match self.mode {
+            OverleafSyncMode::Live => {
+                self.badge_task = None;
+                self.remote_changes = false;
+                if self.poll_task.is_none() {
+                    let (wake, woken) = mpsc::unbounded();
+                    self.poll_wake = Some(wake);
+                    self.poll_task = Some(self.live_poll(woken, cx));
+                }
+            }
+            OverleafSyncMode::Manual => {
+                self.poll_task = None;
+                self.poll_wake = None;
+                self.push_task = None;
+                self.whole_files.stop_timers();
+                if self.badge_task.is_none() {
+                    self.badge_task = Some(self.badge_poll(root, cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn channel_news(&mut self, news: ChannelNews, cx: &mut Context<Self>) {
+        match news {
+            ChannelNews::Joined {
+                entities,
+                client,
+                recovered,
+            } => {
+                if recovered {
+                    notices::show(
+                        Notice::new(
+                            ToastLevel::Success,
+                            t!("Overleaf live editing reconnected."),
+                        )
+                        .key("overleaf-channel"),
+                        cx,
+                    );
+                }
+                self.note_entities(entities);
+                self.client = Some(client);
+                self.presence_joined(cx);
+                self.review_joined_project(cx);
+                self.chat_joined(cx);
+                self.channel = ChannelStatus::Live;
+                self.channel_detail = None;
+                self.toasted_failure = None;
+                self.rejoined = false;
+                // The channel is up: documents held over the drop carry on,
+                // and the shown document can go live.
+                self.resume_held(cx);
+                self.reconsider_live(cx);
+            }
+            ChannelNews::Tree(entities) => self.note_entities(entities),
+            ChannelNews::Event(event) => match event {
+                RealtimeEvent::PresenceUpdated { .. } | RealtimeEvent::PresenceLeft { .. } => {
+                    self.presence_event(event, cx)
+                }
+                RealtimeEvent::ChatMessage { .. } => self.chat_event(event, cx),
+                _ => self.document_event(event, cx),
+            },
+            ChannelNews::Reconnecting(detail) => {
+                self.documents_dropped(true, cx);
+                self.client = None;
+                self.presence_dropped(cx);
+                self.channel = ChannelStatus::Connecting;
+                self.channel_detail = Some(detail.into());
+            }
+            ChannelNews::Failed(detail) => {
+                if self.documents_dropped(false, cx) {
+                    // Their typing is on disk: regular sync takes it up.
+                    self.sync(
+                        SyncOptions {
+                            automatic: true,
+                            ..Default::default()
+                        },
+                        cx,
+                    );
+                }
+                self.client = None;
+                self.presence_dropped(cx);
+                let said = self.toasted_failure.as_deref() == Some(detail.as_str());
+                self.channel = ChannelStatus::Error;
+                self.channel_detail = Some(detail.clone().into());
+                // A channel that could not start is otherwise invisible.
+                if !said && self.mode == OverleafSyncMode::Live {
+                    self.toasted_failure = Some(detail.clone());
+                    notices::show(
+                        Notice::new(
+                            ToastLevel::Info,
+                            t!(
+                                "Live editing with Overleaf could not start ({detail}). Your project still syncs every few seconds.",
+                                detail = &detail
+                            ),
+                        )
+                        .key("overleaf-channel"),
+                        cx,
+                    );
+                }
+                self.check_session(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn note_entities(&mut self, entities: Vec<lattice_core::overleaf_rt::EntityEntry>) {
+        self.entities = entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.path.clone(),
+                    (entity.id.clone(), entity.kind.clone()),
+                )
+            })
+            .collect();
+        self.entity_list = Some(entities);
+    }
+
+    /// Sync now, or join the sync already running, and hear how it went:
+    /// `Err` says why it failed or could not start.
+    pub fn sync_reporting(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        let (sender, receiver) = oneshot::channel();
+        if self.staged {
+            sender.send(Ok(())).ok();
+            return receiver;
+        }
+        if self.syncing {
+            self.queued_waiters.push(sender);
+            return receiver;
+        }
+        self.sync(SyncOptions::default(), cx);
+        self.attach_waiter(sender);
+        receiver
+    }
+
+    fn attach_waiter(&mut self, sender: oneshot::Sender<Result<(), String>>) {
+        if self.syncing {
+            self.sync_waiters.push(sender);
+        } else {
+            sender
+                .send(Err(t!("{action} failed", action = t!("Sync")).to_string()))
+                .ok();
+        }
+    }
+
+    /// The sync the queued waiters asked for, once the one before it ended.
+    fn run_queued(&mut self, cx: &mut Context<Self>) {
+        let queued = std::mem::take(&mut self.queued_waiters);
+        if queued.is_empty() {
+            return;
+        }
+        self.sync(SyncOptions::default(), cx);
+        for sender in queued {
+            self.attach_waiter(sender);
+        }
+    }
+
+    /// Sync now (the toolbar's button, the palette, Review's Apply), or as
+    /// live mode's own. The window saves its editors first.
+    pub fn sync(&mut self, options: SyncOptions, cx: &mut Context<Self>) {
+        if self.staged {
+            return;
+        }
+        let (Some(root), Some(_)) = (self.root.clone(), self.link()) else {
+            return;
+        };
+        if self.syncing {
+            return;
+        }
+        if options.automatic {
+            self.last_auto_sync = Some(Instant::now());
+        }
+        self.syncing = true;
+        self.local_pending = false;
+        cx.notify();
+        let trace = crate::app_log::trace::Trace::start(
+            "Overleaf",
+            t!("Sync"),
+            Some(if options.automatic {
+                t!("automatic").to_string()
+            } else {
+                t!("requested").to_string()
+            }),
+            "Sync",
+            cx,
+        );
+        self.sync_trace = Some(trace);
+        let entities = self.entity_list.clone();
+        let run_root = root.clone();
+        // The live document is the channel's to carry, and a whole-file
+        // document being edited waits until the writer leaves it.
+        let run_live = self.sync_live_paths(&options, cx);
+        self.whole_files.sync_started(&run_live);
+        let observed = options.observed_remote_version;
+        let reviewing = crate::history::review_mode::store::reviewing(&root, cx);
+        let run = cx.background_spawn(async move {
+            // Track changes reads the files the sync may change, first.
+            let reviewed = crate::history::review_mode::store::before_sync(&run_root, reviewing);
+            (sync::sync(&run_root, &run_live, observed, entities), reviewed)
+        });
+        self.sync_task = Some(cx.spawn(async move |this, cx| {
+            let ((result, expired), reviewed) = run.await;
+            this.update(cx, |this, cx| {
+                this.syncing = false;
+                this.after_sync_documents(result.is_ok(), cx);
+                let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+                for waiter in this.sync_waiters.drain(..) {
+                    waiter.send(outcome.clone()).ok();
+                }
+                if expired {
+                    super::session_changed(cx);
+                }
+                if let Some(mut trace) = this.sync_trace.take() {
+                    finished::trace_outcome(&mut trace, &result, &options, cx);
+                }
+                this.whole_files.synced(result.is_ok());
+                match result {
+                    Ok(result) => {
+                        let brought = [result.pulled.clone(), result.merged.clone()].concat();
+                        crate::history::review_mode::store::after_sync(&root, reviewed, &brought, cx);
+                        this.synced(root, result, options, cx)
+                    }
+                    Err(error) => this.failed(error, options, cx),
+                }
+                this.run_queued(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Pause or resume syncing this project. Pausing keeps the link and
+    /// everything it needs, so resuming is an ordinary sync that merges
+    /// whatever changed on either side meanwhile.
+    pub fn set_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
+        if self.staged {
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            notices::error(
+                t!("Open the linked Overleaf project before changing its sync setting."),
+                "",
+                cx,
+            );
+            return;
+        };
+        let task = cx.background_spawn(async move { sync::set_paused(&root, paused) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.reload_link(cx);
+                    if paused {
+                        let weak = cx.entity().downgrade();
+                        notices::show(
+                            Notice::new(ToastLevel::Info, t!("Overleaf sync paused"))
+                                .detail(t!("Edits on both sides merge when you resume"))
+                                .key("overleaf-sync-paused")
+                                .action(NoticeAction::new(t!("Resume"), move |_, cx| {
+                                    weak.update(cx, |this, cx| this.set_paused(false, cx)).ok();
+                                })),
+                            cx,
+                        );
+                    } else {
+                        notices::dismiss("overleaf-sync-paused", cx);
+                    }
+                }
+                Err(error) => notices::error(t!("Could not change Overleaf sync"), error, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn entity(&self, path: &str) -> Option<&(String, String)> {
+        self.entities.get(path)
+    }
+
+    pub(super) fn declined(&self, root: &Path, path: &str) -> bool {
+        self.declined_deletes
+            .contains(&(root.to_path_buf(), path.to_string()))
+    }
+
+    pub(super) fn decline(&mut self, root: &Path, path: &str) {
+        self.declined_deletes
+            .insert((root.to_path_buf(), path.to_string()));
+    }
+
+    /// Whether `root` is still the project this window shows.
+    pub(super) fn is_current(&self, root: &Path) -> bool {
+        self.root.as_deref() == Some(root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosts_match_by_scheme_and_host_alone() {
+        assert!(hosts_match("https://www.overleaf.com", "www.overleaf.com/"));
+        assert!(hosts_match(
+            "HTTPS://WWW.Overleaf.com/project",
+            "https://www.overleaf.com"
+        ));
+        assert!(!hosts_match(
+            "https://www.overleaf.com",
+            "https://overleaf.example.edu"
+        ));
+        assert!(link_matches_session("https://www.overleaf.com", ""));
+    }
+}

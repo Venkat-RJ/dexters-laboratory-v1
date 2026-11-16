@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prior Knowledge"
+  short_description: "Build source-grounded knowledge and identify gaps"
+  default_prompt: "Use $research-prior-knowledge to research sources for the current question."

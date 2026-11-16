@@ -1,0 +1,117 @@
+import { cleanup, renderHook } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
+import { useStableHandlers, visibleInterval } from "./effect-helpers";
+
+afterEach(cleanup);
+
+it("keeps each forwarder's identity while calling the handler from the latest render", () => {
+  const first = vi.fn((value: number) => value + 1);
+  const second = vi.fn((value: number) => value + 2);
+  const view = renderHook(({ onValue }) => useStableHandlers({ onValue }), { initialProps: { onValue: first } });
+  const forwarders = view.result.current;
+  expect(forwarders.onValue(1)).toBe(2);
+
+  view.rerender({ onValue: second });
+  expect(view.result.current).toBe(forwarders);
+  expect(forwarders.onValue(1)).toBe(3);
+  expect(first).toHaveBeenCalledTimes(1);
+});
+
+it("rests a visible-only poll while the window is hidden and checks at once when it is back", () => {
+  vi.useFakeTimers();
+  let visibility: DocumentVisibilityState = "visible";
+  const descriptor = vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
+  const show = (next: DocumentVisibilityState) => {
+    visibility = next;
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+  try {
+    const tick = vi.fn();
+    const stop = visibleInterval(tick, 1000);
+    vi.advanceTimersByTime(2000);
+    expect(tick).toHaveBeenCalledTimes(2);
+
+    show("hidden");
+    vi.advanceTimersByTime(10_000);
+    expect(tick).toHaveBeenCalledTimes(2);
+
+    // Back on screen: one catch-up tick now, then the usual period.
+    show("visible");
+    expect(tick).toHaveBeenCalledTimes(3);
+    vi.advanceTimersByTime(1000);
+    expect(tick).toHaveBeenCalledTimes(4);
+
+    stop();
+    show("hidden");
+    show("visible");
+    vi.advanceTimersByTime(5000);
+    expect(tick).toHaveBeenCalledTimes(4);
+  } finally {
+    descriptor.mockRestore();
+    vi.useRealTimers();
+  }
+});
+
+it("leaves the return to a caller's focus check when the catch-up tick is off", () => {
+  vi.useFakeTimers();
+  let visibility: DocumentVisibilityState = "visible";
+  const descriptor = vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
+  const show = (next: DocumentVisibilityState) => {
+    visibility = next;
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+  try {
+    const tick = vi.fn();
+    const stop = visibleInterval(tick, 1000, { catchUp: false });
+    show("hidden");
+    vi.advanceTimersByTime(10_000);
+    show("visible");
+    expect(tick).not.toHaveBeenCalled();
+    // The period resumes from the moment the window is back.
+    vi.advanceTimersByTime(1000);
+    expect(tick).toHaveBeenCalledTimes(1);
+    stop();
+  } finally {
+    descriptor.mockRestore();
+    vi.useRealTimers();
+  }
+});
+
+it("finishes the paint opportunity when WebKit withholds animation frames", async () => {
+  vi.useFakeTimers();
+  const frame = vi.spyOn(window, "requestAnimationFrame").mockReturnValue(42);
+  const cancel = vi.spyOn(window, "cancelAnimationFrame");
+  try {
+    const { afterNextPaintOpportunity } = await import("./effect-helpers");
+    const finished = vi.fn();
+    void afterNextPaintOpportunity().then(finished);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(finished).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledWith(42);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    frame.mockRestore(); cancel.mockRestore(); vi.useRealTimers();
+  }
+});
+
+it("uses the normal paint path without waiting for the fallback deadline", async () => {
+  vi.useFakeTimers();
+  let draw!: FrameRequestCallback;
+  const frame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => { draw = callback; return 42; });
+  const cancel = vi.spyOn(window, "cancelAnimationFrame");
+  try {
+    const { afterNextPaintOpportunity } = await import("./effect-helpers");
+    const finished = vi.fn();
+    void afterNextPaintOpportunity().then(finished);
+    draw(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(finished).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    draw(1);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(finished).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    frame.mockRestore(); cancel.mockRestore(); vi.useRealTimers();
+  }
+});

@@ -1,0 +1,162 @@
+[workspace]
+resolver = "2"
+members = [
+    "compat/gpui-pre/gpui-pre",
+    "compat/gpui-pre/gpui-pre-macros",
+    "compat/gpui-pre/gpui-pre-platform",
+    "compat/gpui-pre/gpui-pre-sum-tree",
+    "compat/gpui-fast/gpui-fast",
+    "compat/gpui-fast/gpui-fast-platform",
+    "compat/gpui-fast/gpui-fast-web",
+    "compat/sqlite/libsqlite3-sys",
+    "crates/lattice-editor",
+    "crates/lattice-gpui",
+    "crates/lattice-i18n",
+    "crates/lattice-settings",
+    "crates/lattice-ui",
+    "crates/lattice-webview",
+    "crates/trellis",
+]
+# Vendored, patched upstream crates (patches/README.md): path dependencies
+# through `[patch]` below, never workspace members.
+exclude = ["patches"]
+default-members = ["crates/lattice-gpui"]
+
+[workspace.package]
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+# One GPUI for the whole graph: gpui-fast, a fork of Zed's GPUI that tracks
+# the Zed commit the editor crates below are pinned at.
+#
+# Zed's crates (the editor, search, Vim, settings, themes) are pinned at
+# `d2a4fb6`, and the `[patch."https://github.com/zed-industries/zed"]` table
+# swaps Zed's GPUI family for gpui-fast `bbf6dea`, whose `UPSTREAM` file names
+# that same Zed commit. GPUI Kit 0.9.1 and gpui-webview 0.9.1 run on
+# gpui-fast through their `gpui-fast` feature, which asks for the crates.io
+# `gpui-fast*` packages, and GPUI Kit still names the `gpui-pre` snapshot
+# besides. The crates under `compat/` carry those names and versions and
+# re-export the workspace's GPUI, so `[patch.crates-io]` below leaves exactly
+# one GPUI in the graph. Lattice's own changes to GPUI and GPUI Kit live in
+# `patches/` (see its README).
+[workspace.dependencies]
+assets = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+clock = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+editor = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b", features = ["profiler"] }
+gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b", features = ["font-kit", "runtime_shaders"] }
+language = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+markdown = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+multi_buffer = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+project = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+release_channel = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+search = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+settings = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+task = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+sum_tree = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+terminal = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+theme = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+theme_settings = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+util = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+vim = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+vim_mode_setting = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+workspace = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+zed_actions = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+
+gpui-kit = { version = "=0.9.1", features = ["gpui-fast"] }
+gpui-webview = { version = "=0.9.1", features = ["gpui-fast"] }
+
+anyhow = "1"
+dirs = "6"
+codebook-tree-sitter-latex = "0.6.1"
+# Markdown source highlighting: the block and inline grammars at the revision
+# Zed pins (its fork of tree-sitter-grammars/tree-sitter-markdown, MIT, with a
+# serialize() overflow fix).
+tree-sitter-md = { git = "https://github.com/zed-industries/tree-sitter-markdown", rev = "b596e737286780d7bfa9fcddceaeeb754574b352" }
+futures = "0.3"
+image = { version = "0.25", default-features = false }
+# Lattice's domain logic, shared with the Tauri app (`../src-tauri/lattice-core`,
+# Apache-2.0): projects, the file tree, builds, SyncTeX, saving and the
+# project watcher.
+lattice-core = { path = "../src-tauri/lattice-core" }
+lattice-editor = { path = "crates/lattice-editor" }
+lattice-i18n = { path = "crates/lattice-i18n" }
+lattice-settings = { path = "crates/lattice-settings" }
+lattice-ui = { path = "crates/lattice-ui" }
+lattice-webview = { path = "crates/lattice-webview" }
+trellis = { path = "crates/trellis" }
+log = "0.4"
+pdfium-render = { version = "0.9.5", default-features = false, features = ["pdfium_8125", "thread_safe"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = "1"
+
+# Zed's GPUI family, replaced by gpui-fast. `util` stays Zed's: gpui-fast's
+# copy has its own `rel_path` types, which Zed's crates reject. GPUI itself
+# is the vendored, patched copy (patches/README.md).
+[patch."https://github.com/zed-industries/zed"]
+gpui = { path = "patches/gpui-fast/crates/gpui" }
+bench_metrics = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+collections = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_apple = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_ios = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_linux = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_macros = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_platform = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_shared_string = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_util = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_web = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_wgpu = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+gpui_windows = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+http_client = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+http_client_tls = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+refineable = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+derive_refineable = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+scheduler = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+sum_tree = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+zlog = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+ztracing = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+ztracing_macro = { git = "https://github.com/longbridge/gpui-fast", rev = "bbf6dead71bb5dbfd3c3592f7a3d0137d5cf81aa" }
+
+# gpui-fast's own crates name GPUI and its macOS platform by gpui-fast's
+# source; both are the vendored copies.
+[patch."https://github.com/longbridge/gpui-fast"]
+gpui = { path = "patches/gpui-fast/crates/gpui" }
+gpui_macos = { path = "patches/gpui-fast/crates/gpui_macos" }
+
+[patch.crates-io]
+gpui-pre = { path = "compat/gpui-pre/gpui-pre" }
+gpui-pre-macros = { path = "compat/gpui-pre/gpui-pre-macros" }
+gpui-pre-platform = { path = "compat/gpui-pre/gpui-pre-platform" }
+gpui-pre-sum-tree = { path = "compat/gpui-pre/gpui-pre-sum-tree" }
+gpui-fast = { path = "compat/gpui-fast/gpui-fast" }
+gpui-fast-platform = { path = "compat/gpui-fast/gpui-fast-platform" }
+gpui-fast-web = { path = "compat/gpui-fast/gpui-fast-web" }
+gpui-component = { path = "patches/gpui-component" }
+gpui-base = { path = "patches/gpui-base" }
+gpui-webview = { path = "patches/gpui-webview" }
+# One SQLite: Zed's `sqlez` asks for libsqlite3-sys 0.30 and lattice-core's
+# rusqlite for 0.38, and only one crate in a graph may link `sqlite3`. The
+# shim carries 0.30's name and version and re-exports 0.38
+# (compat/sqlite/README.md).
+libsqlite3-sys = { path = "compat/sqlite/libsqlite3-sys" }
+
+# Copied from Zed's workspace at the pinned revision: a dependency's
+# `[patch]` table does not apply, so Zed's crates only build with these here.
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "803c6ebaac27d69e1808b45058482e868d073ceb" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+debug = 0
+strip = "symbols"

@@ -1,0 +1,194 @@
+//! Lattice's LaTeX writing flow on GPUI, in Lattice's look: a project folder
+//! in a file tree, Zed's editor with LaTeX highlighting and search, a PDFium
+//! preview, latexmk builds with diagnostics, all in GPUI Kit's dockable
+//! panels drawn as the Tauri app draws its own.
+//!
+//! Usage: `lattice-gpui [PROJECT_DIR]`; scripted runs (`e2e` on macOS and
+//! Windows, the measurements on macOS):
+//! `lattice-gpui PROJECT_DIR --scenario e2e|perf|ime --out RESULT.json`.
+
+mod agent;
+mod annotations;
+mod app;
+mod app_log;
+mod asset_preview;
+mod assets;
+mod build;
+mod build_panel;
+mod confirm;
+mod crash;
+mod editor_panel;
+mod editor_status;
+mod empty_slot;
+mod file_tree;
+mod first_pages;
+mod gallery;
+mod get_started;
+mod help;
+mod history;
+mod host_errors;
+mod html_preview;
+mod insert;
+mod interface_zoom;
+mod live_preview;
+mod moved_paths;
+#[cfg(target_os = "macos")]
+mod native;
+#[cfg(target_os = "windows")]
+#[path = "native_windows.rs"]
+mod native;
+mod notices;
+mod outline;
+mod overleaf;
+mod paint_probe;
+mod panels;
+mod papers;
+mod pdf;
+mod project;
+mod recents;
+mod research_art;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod scenario;
+mod screen_color;
+mod search;
+mod settings;
+mod shell;
+mod sounds;
+mod status_counters;
+mod structured;
+mod submission;
+mod terminal;
+mod titlebar;
+mod updater;
+mod welcome;
+mod window_material;
+
+fn main() {
+    // The Agent's sidecar runs this binary as its helpers, as it runs the
+    // Tauri app's (`src-tauri/src/lib.rs`): Lattice's own `ps` inside the
+    // bibliography sandbox (only macOS has one, so only there), and the
+    // literature, research-environment and model-endpoint commands. Each
+    // serves its request and exits before anything starts GPUI or AppKit.
+    #[cfg(target_os = "macos")]
+    lattice_core::process_inspector::run_if_requested();
+    if lattice_core::agent_literature::run_cli()
+        || lattice_core::research_env::run_cli()
+        || lattice_core::model_endpoint::run_cli()
+    {
+        return;
+    }
+    init_logging();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let (root, scenario) = scenario::parse_args();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let root = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let scripted = scenario.is_some();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let scripted = false;
+    // From here a panic is logged and the open edits are written before
+    // the app ends (`crash.rs`).
+    crash::install(shell::workspaces::state_dir(scripted));
+
+    // A scenario run copies and pastes on a pasteboard of its own, so runs
+    // side by side (`scenario/input_lock.rs`) cannot read each other's copies.
+    // Before GPUI starts: it keeps the pasteboard it finds then.
+    #[cfg(target_os = "macos")]
+    if scenario.is_some() {
+        native::use_private_pasteboard();
+    }
+
+    // The parity harness's named regions are recorded from the first frame.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if scenario
+        .as_ref()
+        .is_some_and(|scenario| scenario.name == "parity")
+    {
+        lattice_ui::parity::enable();
+    }
+
+    let application = gpui_kit::application().with_assets(assets::Assets);
+    // The Dock icon clicked with no window open opens one again.
+    if app::outlives_windows(scripted) {
+        application.on_reopen(|cx| {
+            if cx.windows().is_empty() {
+                shell::windows::reopen(cx);
+            }
+        });
+    }
+    application.run(move |cx| {
+        app::init(scripted, cx);
+        // `--gallery`: the component sheet instead of a project window.
+        if std::env::args().any(|arg| arg == "--gallery") {
+            if let Err(error) = gallery::open(cx) {
+                log::error!("could not open the gallery: {error:#}");
+                cx.quit();
+            }
+            cx.activate(true);
+            return;
+        }
+        // A scripted measurement leaves the user's frontmost app alone.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let activate = scenario.is_none();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let activate = true;
+        let launch = root.is_none() && activate;
+        match shell::Shell::open_window(root, cx) {
+            Ok((_window, _shell)) => {
+                // Without a project named, reopen the one used last.
+                if launch {
+                    _window
+                        .update(cx, |_, window, cx| {
+                            _shell.update(cx, |shell, cx| shell.launch(window, cx))
+                        })
+                        .ok();
+                }
+                // The launch after a crash says so, once a window shows.
+                crash::announce_previous_crash(cx);
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                if let Some(scenario) = scenario {
+                    scenario::start(_shell, _window, scenario, cx);
+                }
+            }
+            Err(error) => {
+                log::error!("could not open the window: {error:#}");
+                cx.quit();
+            }
+        }
+        if activate {
+            cx.activate(true);
+        }
+    });
+}
+
+/// Warnings and errors to stderr, and to the app's log
+/// (`app_log::capture`); `LATTICE_GPUI_LOG=info` for more on stderr.
+fn init_logging() {
+    struct StderrLogger(log::LevelFilter);
+
+    impl log::Log for StderrLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= self.0
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                eprintln!("[{} {}] {}", record.level(), record.target(), record.args());
+            }
+            // Errors, and Lattice's own warnings, reach the app's log too.
+            app_log::capture::capture(record);
+        }
+
+        fn flush(&self) {}
+    }
+
+    let level = match std::env::var("LATTICE_GPUI_LOG").as_deref() {
+        Ok("debug") => log::LevelFilter::Debug,
+        Ok("info") => log::LevelFilter::Info,
+        _ => log::LevelFilter::Warn,
+    };
+    let logger = Box::leak(Box::new(StderrLogger(level)));
+    if log::set_logger(logger).is_ok() {
+        log::set_max_level(level);
+    }
+}

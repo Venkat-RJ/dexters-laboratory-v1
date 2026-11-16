@@ -1,0 +1,119 @@
+# Zotero, Heptabase and the Agent panel
+
+For writers who read in Zotero, take notes in another app, and write in
+Lattice. Two parts: bringing papers from Zotero into the Papers library, and
+letting the Agent panel reach your Zotero library and your notes through MCP
+servers.
+
+## Import papers from Zotero into Papers
+
+Nothing needs turning on in Zotero, and Zotero can be open or closed.
+
+1. In Lattice, open **Papers → Add papers** and choose **Zotero…**.
+2. Open **My Library** or a folder in the folder tree (search it, or open a
+   folder's subfolders with its arrow). Its papers list beside it; turn on
+   **Include subfolders** to list the papers of every folder below it too.
+3. Tick the papers you want, or **Select all**, and choose **Add N papers**.
+   Only ticked papers in the list on screen are added, and opening another
+   folder clears the ticks. A paper Papers already holds (same DOI, arXiv id or citation key) reads
+   **In Papers** and cannot be ticked.
+
+**Back** returns to the paste box, and Escape steps back one level. In a narrow
+window the folders and the papers show one at a time, with **Folders** to go
+back.
+
+Lattice finds the Zotero data folder the way Zotero does (the folder set in
+Zotero's **Settings → Advanced → Files and Folders**, otherwise `~/Zotero`) and
+reads profiles from `%APPDATA%\Zotero\Zotero` on Windows,
+`~/Library/Application Support/Zotero` on macOS, and `~/.zotero/zotero` on Linux.
+On Windows the default data directory is `%USERPROFILE%\Zotero`.
+It reads a private copy of its `zotero.sqlite`, never the live file. If the library
+lives somewhere Lattice cannot find, choose its folder with **Choose Zotero
+folder…**. Only your personal library is read; group libraries are not.
+
+Citation keys stay the ones you cite with: a Better BibTeX key is used when
+Better BibTeX keeps one, then a key in the item's Citation Key field or pinned in
+its Extra field as `Citation Key: …`, otherwise a key in the shape of Zotero's
+own export (`lastname_firstword_year`). When two items would share a key, the
+one added to Zotero later gets a letter suffix (`b`, `c`, …), so every paper
+keeps its own key. An item with an arXiv id brings its full
+text from arXiv; otherwise its PDF attachment, when the file is on this computer,
+becomes the paper's readable text. Items without either are added as citations
+only.
+
+### Annotations
+
+A paper whose PDF you highlighted or commented on in Zotero shows how many annotations it holds beside its title.
+Adding it brings them into the paper's note, `notes/<citation key>.md`, under **Zotero annotations**: each highlight or underline as a quote, each comment as a paragraph, in Zotero's reading order.
+Every annotation ends with two links.
+The page link (**p. 12**, the page as the PDF prints it) opens the paper's PDF in Lattice at that page, with the passage marked.
+**Zotero** opens the annotation in Zotero's own PDF reader (`zotero://open-pdf/library/items/<KEY>?page=N&annotation=<KEY>`).
+
+A paper already in Papers can still be ticked when it has annotations; **Add annotations** brings them into its note without adding the paper again.
+Bringing annotations in again adds only the ones the note does not hold yet, so your own edits to the note stay as they are.
+The PDF of a paper added from Zotero is kept with the paper, so the page links work even after Zotero moves or renames the file.
+
+To bring in a library from another computer, export the collection from Zotero (or
+with Better BibTeX) as a `.bib` file and paste the whole file into **Add papers**,
+or link it with **Linked library…** to take in later changes after review.
+
+The import only reads from Zotero; nothing is written back, annotations included.
+
+## Let the Agent use Zotero and your notes
+
+The Agent panel runs your own agent CLI, so it can use the MCP servers you set
+up for that CLI. Nothing is configured inside Lattice beyond the one switch
+below.
+
+- **Claude:** add servers with `claude mcp add --scope user …` (user scope, so
+  every project folder sees them), then turn on **Settings → Agent → Providers →
+  Load my MCP servers in Claude**. It is off by default because a new chat waits
+  for every server to connect first. It applies to new and restarted chats.
+- **Codex:** add servers with `codex mcp add …`. Codex reads them from
+  `~/.codex/config.toml` in every chat; there is no switch.
+
+### Zotero
+
+[Zotero MCP](https://github.com/54yyyu/zotero-mcp) (`zotero-mcp-server` on
+PyPI) reads your local library through Zotero's local API, which answers only
+when **Settings → Advanced → Allow other applications on this computer to
+communicate with Zotero** is on in Zotero. Unlike the import above, this server
+needs that setting.
+
+```bash
+uv tool install zotero-mcp-server      # or: pipx install zotero-mcp-server
+
+# Claude
+claude mcp add --scope user zotero -e ZOTERO_LOCAL=true -- zotero-mcp
+
+# Codex
+codex mcp add zotero --env ZOTERO_LOCAL=true -- zotero-mcp
+```
+
+### Heptabase
+
+Heptabase runs an official remote MCP server at `https://api.heptabase.com/mcp`
+([Heptabase MCP](https://support.heptabase.com/en/articles/12679581-heptabase-mcp)).
+It needs a Heptabase Pro, Premium or Premium+ plan (or a trial), also for
+read-only access, and you sign in to Heptabase once.
+
+```bash
+# Claude: add it, then run `claude` in a terminal, enter /mcp and pick heptabase-mcp to sign in
+claude mcp add --scope user --transport http heptabase-mcp https://api.heptabase.com/mcp
+
+# Codex: add it, then sign in
+codex mcp add heptabase --url https://api.heptabase.com/mcp
+codex mcp login heptabase
+```
+
+Grant read-only access when you sign in if the agent should only read your
+notes. On a free Heptabase plan, export the cards you need as Markdown into the
+project folder instead; the agent reads project files without any setup.
+
+### Check it
+
+Open a new chat in the Agent panel and ask, for example, "Search my Heptabase
+notes for the related-work section and summarise what I wrote." If the agent
+says it has no such tool, check that the server is listed by `claude mcp list`
+or `codex mcp list`, that the Claude switch is on, and that the chat was started
+after the change.

@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "date": "2026-11-16",
+  "highlights": [
+    {
+      "title": {
+        "en": "Dexter's Laboratory V1",
+        "zh": "Dexter's Laboratory V1"
+      },
+      "body": {
+        "en": "Research stages, linked mind maps, experiment records, validation and overall progress charts in one workspace.",
+        "zh": "在同一工作空间内记录研究阶段、思维导图、实验、验证结果和整体进展。"
+      }
+    }
+  ],
+  "fixes": [
+    {
+      "en": "Public source uses neutral research templates and a separate application identity.",
+      "zh": "公开源码使用空白研究模板和独立的应用标识。"
+    }
+  ]
+}

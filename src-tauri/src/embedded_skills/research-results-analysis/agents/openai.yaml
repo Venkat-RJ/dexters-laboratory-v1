@@ -1,0 +1,4 @@
+interface:
+  display_name: "Results Analysis"
+  short_description: "Interpret results and decide the next research step"
+  default_prompt: "Use $research-results-analysis to analyze the experiment outputs and recommend the next step."

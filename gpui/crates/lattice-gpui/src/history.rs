@@ -1,0 +1,38 @@
+//! The project's history, ported from the Tauri app's `src/history/`: the
+//! History tool panel (Lattice's own activity and the project's git versions
+//! on one timeline), a version or an entry opened to read its changes as
+//! prose or as a source diff, the comparison of any two versions, the PDF
+//! with those changes marked (latexdiff), and the resolver for a file a
+//! merge left with conflict markers. lattice-core does the work, as it does
+//! for the Tauri app (`git`, `project::history`, `latex::changes`). A
+//! project linked to Overleaf also shows Overleaf's own history (`overleaf`).
+
+mod art;
+mod body;
+mod checkpoint_rows;
+mod compare;
+pub mod conflict_resolver;
+pub mod conflicts;
+pub(crate) mod diff_view;
+mod export_changes;
+mod inline_edits;
+pub(crate) mod messages;
+mod overleaf;
+mod overleaf_rows;
+pub mod panel;
+mod prose;
+pub mod review_mode;
+mod row;
+pub(crate) mod time;
+mod timeline;
+mod view;
+pub(crate) mod widgets;
+mod words;
+
+/// A handler that opens a file at a line, as the passages and diffs call it.
+type OnLine = std::rc::Rc<dyn Fn(usize, &mut gpui::Window, &mut gpui::App)>;
+
+pub use checkpoint_rows::CheckpointItem;
+pub use conflict_resolver::{ConflictEvent, ConflictResolver};
+pub use panel::{HistoryEvent, HistoryPanel};
+pub use widgets::inline_message;

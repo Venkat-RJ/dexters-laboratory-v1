@@ -1,0 +1,7 @@
+/target
+/vendor
+# rust-analyzer can open a vendored crate's own workspace and build it there.
+/patches/*/target
+/patches/*/Cargo.lock
+# The island pages, built by script/build-islands from ../src.
+/islands/dist

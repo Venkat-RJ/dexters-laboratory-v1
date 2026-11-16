@@ -1,0 +1,4 @@
+interface:
+  display_name: "Problem Formulation"
+  short_description: "Define the question, scope and success criteria"
+  default_prompt: "Use $research-formulation to formulate the research problem from my context."

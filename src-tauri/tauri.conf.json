@@ -1,0 +1,202 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Dexter's Laboratory V1",
+  "version": "1.0.0",
+  "identifier": "app.dexterslaboratory.v1",
+  "build": {
+    "beforeDevCommand": "pnpm prepare:runtime:dev && pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm prepare:build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "create": false,
+        "title": "Dexter's Laboratory V1",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 640,
+        "minHeight": 680,
+        "backgroundColor": "#F7F7F6",
+        "center": true,
+        "visible": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": [
+          "'none'"
+        ],
+        "script-src": [
+          "'self'",
+          "'unsafe-inline'",
+          "https:"
+        ],
+        "style-src": [
+          "'self'",
+          "'unsafe-inline'"
+        ],
+        "img-src": [
+          "'self'",
+          "data:",
+          "blob:",
+          "http:",
+          "https:"
+        ],
+        "font-src": [
+          "'self'",
+          "data:"
+        ],
+        "media-src": [
+          "'self'",
+          "data:",
+          "blob:",
+          "http:",
+          "https:"
+        ],
+        "connect-src": [
+          "'self'",
+          "ipc:",
+          "http://ipc.localhost",
+          "http:",
+          "https:",
+          "ws:",
+          "blob:"
+        ],
+        "worker-src": [
+          "'self'",
+          "blob:"
+        ],
+        "frame-src": [
+          "'self'",
+          "http:",
+          "https:"
+        ],
+        "child-src": [
+          "'self'",
+          "blob:",
+          "http:",
+          "https:"
+        ],
+        "object-src": [
+          "'none'"
+        ],
+        "base-uri": [
+          "'none'"
+        ],
+        "form-action": [
+          "'none'"
+        ],
+        "frame-ancestors": [
+          "'none'"
+        ]
+      },
+      "devCsp": {
+        "default-src": [
+          "'none'"
+        ],
+        "script-src": [
+          "'self'",
+          "'unsafe-inline'",
+          "https:"
+        ],
+        "style-src": [
+          "'self'",
+          "'unsafe-inline'"
+        ],
+        "img-src": [
+          "'self'",
+          "data:",
+          "blob:",
+          "http:",
+          "https:"
+        ],
+        "font-src": [
+          "'self'",
+          "data:"
+        ],
+        "media-src": [
+          "'self'",
+          "data:",
+          "blob:",
+          "http:",
+          "https:"
+        ],
+        "connect-src": [
+          "'self'",
+          "ipc:",
+          "http://ipc.localhost",
+          "http:",
+          "https:",
+          "ws:",
+          "blob:"
+        ],
+        "worker-src": [
+          "'self'",
+          "blob:"
+        ],
+        "frame-src": [
+          "'self'",
+          "http:",
+          "https:"
+        ],
+        "child-src": [
+          "'self'",
+          "blob:",
+          "http:",
+          "https:"
+        ],
+        "object-src": [
+          "'none'"
+        ],
+        "base-uri": [
+          "'none'"
+        ],
+        "form-action": [
+          "'none'"
+        ],
+        "frame-ancestors": [
+          "'none'"
+        ]
+      },
+      "dangerousDisableAssetCspModification": [
+        "script-src"
+      ]
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": []
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "resources": [
+      "presentation-runtime/",
+      "synara-runtime/**/*",
+      "src/embedded_skills/"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-",
+      "entitlements": "Entitlements.plist",
+      "files": {
+        "Resources/zh-Hans.lproj/InfoPlist.strings": "macos/zh-Hans.lproj/InfoPlist.strings"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

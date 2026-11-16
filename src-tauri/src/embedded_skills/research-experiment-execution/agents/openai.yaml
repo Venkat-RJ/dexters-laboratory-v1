@@ -1,0 +1,4 @@
+interface:
+  display_name: "Experiment Execution"
+  short_description: "Run experiments and retain reproducible evidence"
+  default_prompt: "Use $research-experiment-execution to run the planned experiment within its limits."

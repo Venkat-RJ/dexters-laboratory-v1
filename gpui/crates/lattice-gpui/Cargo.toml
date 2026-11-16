@@ -1,0 +1,127 @@
+[package]
+name = "lattice-gpui"
+version = "0.1.0"
+description = "GPUI prototype of Lattice's LaTeX writing flow: file tree, Zed's editor, PDF preview, latexmk builds, dockable panels."
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+# The `shot` scenario draws the window itself and reads the frame back from
+# Metal, so a look review can be captured with the screen locked or the window
+# covered. GPUI exposes that read-back only to its test support, so this is
+# never part of a release build.
+offscreen-shots = ["gpui/test-support", "gpui_platform/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+# A terminal's exit status, from Zed's terminal (terminal/launch.rs).
+async-channel = "2.5"
+# The history timeline's dates in the local time zone (history/time.rs), and
+# a pasted image's name, which carries the time as the Tauri app's does.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+assets.workspace = true
+# An Excel export's bytes cross the island bridge as base64.
+base64 = "0.22"
+# A buffer's version, which the Overleaf review compares with the one it last
+# drew; already in the graph through the editor.
+clock.workspace = true
+codebook-tree-sitter-latex.workspace = true
+dirs.workspace = true
+editor.workspace = true
+# The Tauri app's figure-path patterns use lookahead (moved_paths.rs).
+fancy-regex = "0.19"
+flate2 = "1"
+futures.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-kit.workspace = true
+# The .bib list's Author and Title sorts, in `localeCompare`'s order.
+icu_collator = "2.3"
+hdrhistogram = { version = "7", default-features = false }
+image.workspace = true
+minisign-verify = "0.2"
+indexmap = { version = "2", features = ["serde"] }
+language.workspace = true
+lattice-core.workspace = true
+lattice-editor.workspace = true
+lattice-i18n.workspace = true
+lattice-settings.workspace = true
+# The history's source diffs, as a patch GPUI Kit's diff reads (history/diff_view.rs).
+similar = "2"
+lattice-ui.workspace = true
+lattice-webview.workspace = true
+# The Overleaf sign-in window: Overleaf's login page in a webview of its own,
+# whose cookies are read once the writer has signed in (overleaf/account.rs).
+gpui-webview.workspace = true
+wry = { package = "lb-wry", version = "=0.53.3" }
+log.workspace = true
+# The paper reader renders a saved paper's Markdown (papers/reader.rs); the
+# editor already depends on it.
+markdown.workspace = true
+pdfium-render.workspace = true
+# The Tauri app's TeX message and word patterns (crate::build).
+regex = "1"
+release_channel.workspace = true
+project.workspace = true
+search.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+smallvec.workspace = true
+# The Terminal panel: Zed's alacritty-based terminal, its shell spec and path style.
+task.workspace = true
+terminal.workspace = true
+theme.workspace = true
+# The live preview paints rtex's display lists into page images
+# (`live_preview/paint.rs`) from OpenType outlines (`live_preview/fonts.rs`);
+# both already in the graph through resvg.
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ttf-parser = "0.25"
+# lattice-core's link preview runs on Tokio, on a thread of its own per
+# request; already in the graph through lattice-core.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+theme_settings.workspace = true
+# Trellis ported to GPUI: under its own non-commercial license (crates/trellis/README.md).
+trellis.workspace = true
+# Open Slide lease owners (structured/slides.rs).
+tar = "0.4"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+util.workspace = true
+vim.workspace = true
+vim_mode_setting.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+
+# The e2e scenario's stand-in for Overleaf zips its project
+# (scenario/overleaf_mock.rs); the version lattice-core already uses.
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+# Its live channel speaks Socket.IO over a websocket
+# (scenario/overleaf_realtime_mock.rs); the version lattice-core's realtime
+# client already uses.
+tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
+
+[dev-dependencies]
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+# AppKit's colour sampler takes its handler as a block (`screen_color.rs`);
+# the version objc2 0.6 and GPUI's macOS platform already use.
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSGeometry", "NSLocale", "NSRange", "NSString"] }
+
+# The version Zed's gpui_windows already uses, so it adds no crate.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

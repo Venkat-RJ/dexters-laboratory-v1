@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "status": "checking",
+  "checkedAt": null,
+  "runtime": null,
+  "dependencies": null,
+  "compute": null,
+  "inputs": [],
+  "evaluator": null,
+  "checks": [],
+  "baseline": null,
+  "blockers": [
+    "Setup has not started. No environment or baseline has been validated."
+  ]
+}

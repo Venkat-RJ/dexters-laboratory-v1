@@ -1,0 +1,234 @@
+//! The chrome around a source editor that the Tauri app's document canvas
+//! and Trellis header give it (`document-canvas.tsx`,
+//! `trellis-latex-view-switch.tsx`): for a `.tex` file, the outline rail
+//! over the editor's right edge, whose width the text gives up, and the
+//! Source / Visual switch in the panel's strip, shown in room to spare
+//! before the Build chip (the ⋯ menu repeats it), which chooses the view
+//! every `.tex` file is shown in (`latex_view.rs`).
+
+use gpui::{
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Styled as _, Window, div,
+};
+use lattice_editor::LatticeEditor;
+use lattice_i18n::tc;
+use lattice_settings::LatexView;
+use lattice_ui::ActiveLattice as _;
+
+use super::{
+    EditorPanel, EditorPanelEvent,
+    latex_view::{choose_latex_view, chosen_latex_view, is_latex_document},
+    outline_rail::{OutlineRail, OutlineRailEvent, RAIL_CLEARANCE},
+};
+use crate::project::Project;
+
+impl EditorPanel {
+    /// The outline rail for the `.tex` file at `relative` in `lattice`.
+    pub(super) fn new_rail(
+        lattice: &Entity<LatticeEditor>,
+        project: &Entity<Project>,
+        relative: String,
+        source: String,
+        cx: &mut Context<Self>,
+    ) -> Entity<OutlineRail> {
+        let root = project.read(cx).root().to_path_buf();
+        let rail = cx.new(|cx| {
+            let mut rail = OutlineRail::new(lattice.clone(), root, relative.clone(), cx);
+            rail.set_source(relative, source, cx);
+            rail
+        });
+        cx.subscribe(&rail, |_, _, event: &OutlineRailEvent, cx| match event {
+            OutlineRailEvent::Jump { path, line } => cx.emit(EditorPanelEvent::OutlineJump {
+                path: path.clone(),
+                line: *line,
+            }),
+        })
+        .detach();
+        // Whether it shows decides the room the text keeps.
+        cx.observe(&rail, |_, _, cx| cx.notify()).detach();
+        rail
+    }
+
+    /// The outline rail, for a `.tex` file.
+    pub fn outline_rail(&self) -> Option<&Entity<OutlineRail>> {
+        self.rail.as_ref()
+    }
+
+    /// The manuscript's outline, as the shell last read it, and its root
+    /// document: what the rail marks.
+    pub fn set_manuscript_outline(
+        &mut self,
+        headings: std::rc::Rc<[crate::outline::Heading]>,
+        root: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.latex_root != root {
+            self.latex_root = root.clone();
+            self.forward_latex_context(cx);
+        }
+        self.note_latex_outline(headings.clone(), cx);
+        if let Some(rail) = &self.rail {
+            rail.update(cx, |rail, cx| rail.set_manuscript(headings, root, cx));
+        }
+    }
+
+    /// Give a `.tex` file's strip its Source / Visual switch (in room to
+    /// spare, before the Build chip), or take it away from another file's.
+    pub(super) fn offer_view_switch(&mut self, cx: &mut Context<Self>) {
+        let panel = gpui_kit::component::dock::PanelId::from(cx.entity_id());
+        let tools = is_latex_document(&self.path).then(|| lattice_ui::dock::SpareTools {
+            width: std::rc::Rc::new(|window, cx| {
+                let names = [
+                    tc!("LaTeX editor view", "Source"),
+                    tc!("LaTeX editor view", "Visual"),
+                ];
+                lattice_ui::components::ViewSwitch::width(&names, true, window, cx)
+            }),
+            render: std::rc::Rc::new(|_, cx| latex_view_switch(cx).into_any_element()),
+        });
+        lattice_ui::dock::set_spare_tools(panel, tools, cx);
+        // The build chip keeps only its mark in a strip short of room; a
+        // view switch, a board, sheet or deck draw the same there.
+        let this = cx.entity().downgrade();
+        let saving: lattice_ui::dock::IconSaving = std::rc::Rc::new(move |window, cx| {
+            let chip = this
+                .upgrade()
+                .is_some_and(|panel| panel.read(cx).shows_build_chip());
+            if chip {
+                crate::editor_status::build_chip_icon_saving(window, cx)
+            } else {
+                gpui::px(0.)
+            }
+        });
+        lattice_ui::dock::set_icon_saving(panel, Some(saving), cx);
+    }
+
+    /// Whether the strip carries the build chip: no view switch in its
+    /// place, and not a board, sheet or deck, which carry no tools.
+    pub(super) fn shows_build_chip(&self) -> bool {
+        self.structured.is_none() && self.document_view().is_none()
+    }
+
+    /// The source editor, with the outline rail over its right edge when the
+    /// file has one and the editor room for it; the text gives up the rail's
+    /// width.
+    pub(super) fn render_source(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rail_shown = self.rail.as_ref().is_some_and(|rail| rail.read(cx).shown());
+        let margin = self.margin_layer(self.editor_width.get(), window, cx);
+        let clearance = match (&margin, rail_shown) {
+            (Some((margin, _)), _) => *margin,
+            (None, true) => RAIL_CLEARANCE,
+            (None, false) => gpui::px(0.),
+        };
+        self.lattice
+            .update(cx, |lattice, cx| lattice.set_end_clearance(clearance, cx));
+        let width = self.editor_width.clone();
+        let rail = self.rail.clone();
+        let this = cx.entity().downgrade();
+        div()
+            .id("lattice-source")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            // The writer moving on by hand ends a rail jump's hold on the
+            // current section, unless it is on the rail.
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.release_rail(cx)))
+            // A press on an annotation's pin opens its note.
+            .capture_any_mouse_down(cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                if this.annotation_pin_pressed(event.position, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            // The selection toolbar waits while a selection is dragged out
+            // (it hears the pointer come up anywhere in the window).
+            .capture_any_mouse_down(cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                this.toolbar_pointer(true, event.position, cx)
+            }))
+            .capture_key_down(cx.listener(|this, _, _, cx| this.release_rail(cx)))
+            // The open proofread card's ⌘↵ and Esc, ahead of the editor's
+            // own (Zed's keymap binds them to its actions, which a window
+            // dispatches before any key listener).
+            .capture_action(cx.listener(|this, _: &editor::actions::NewlineBelow, window, cx| {
+                if this.proofread_accept_key(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                if this.proofread_escape(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(self.lattice.clone())
+            .children(self.rail.clone())
+            .children(margin.map(|(_, layer)| layer))
+            .children(self.annotation_composer(window, cx))
+            .children(self.selection_toolbar(window, cx))
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let new = bounds.size.width;
+                        if width.get() != Some(new) {
+                            width.set(Some(new));
+                            if let Some(rail) = rail.clone() {
+                                cx.defer(move |cx| {
+                                    rail.update(cx, |rail, cx| rail.set_editor_width(new, cx))
+                                });
+                            }
+                        }
+                        window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+                    },
+                    // A wheel over the source ends the hold too. Zed and the
+                    // gutter stop a wheel that scrolls them, so the release
+                    // listens before them, in the capture phase.
+                    move |_, hitbox, window, _| {
+                        window.on_mouse_event(move |_: &gpui::ScrollEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Capture
+                                && hitbox.should_handle_scroll(window)
+                            {
+                                this.update(cx, |this, cx| this.release_rail(cx)).ok();
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    fn release_rail(&mut self, cx: &mut Context<Self>) {
+        if let Some(rail) = &self.rail
+            && !rail.read(cx).hovered()
+        {
+            rail.update(cx, |rail, cx| rail.release(cx));
+        }
+    }
+}
+
+/// A .tex file's Source / Visual switch (`TrellisLatexViewSwitch`): the
+/// choice is every `.tex` file's, so every open one follows.
+fn latex_view_switch(cx: &App) -> impl IntoElement {
+    let palette = cx.palette();
+    let view = chosen_latex_view(cx);
+    lattice_ui::components::ViewSwitch::new("latex-view-switch")
+        .mode(
+            lattice_ui::Icon::CODE_XML,
+            tc!("LaTeX editor view", "Source"),
+            view == LatexView::Source,
+            |_, _, cx| choose_latex_view(LatexView::Source, cx),
+        )
+        .mode(
+            lattice_ui::Icon::TYPE,
+            tc!("LaTeX editor view", "Visual"),
+            view == LatexView::Visual,
+            |_, _, cx| choose_latex_view(LatexView::Visual, cx),
+        )
+        .surface(palette.editor)
+        .parity("editor/view-switch")
+}

@@ -1,0 +1,94 @@
+.workspace.trellis-workspace { position: relative; }
+
+.laboratory-pet {
+  --pet-resting-image: url("../../src-tauri/icons/app-icon.svg");
+  position: absolute;
+  right: 18px;
+  bottom: 16px;
+  z-index: 25;
+  width: 120px;
+  height: 120px;
+  pointer-events: none;
+}
+
+.laboratory-pet button { pointer-events: auto; }
+
+.laboratory-pet-activity {
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  width: max-content;
+  max-width: 200px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-sidebar);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.laboratory-pet-body {
+  display: block;
+  width: 120px;
+  height: 120px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  transform: translateX(0);
+  transition: transform 2.2s linear;
+}
+
+.laboratory-pet[data-side="left"] .laboratory-pet-body {
+  transform: translateX(-130px);
+}
+
+.laboratory-pet-body:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; border-radius: 12px; }
+
+.laboratory-pet-sprite {
+  display: block;
+  width: 120px;
+  height: 120px;
+  background: var(--pet-resting-image) center / contain no-repeat;
+  filter: drop-shadow(0 6px 5px var(--elevation-ring));
+}
+
+.laboratory-pet:not([data-action="idle"]) .laboratory-pet-sprite {
+  animation: laboratory-pet-pulse 1.6s ease-in-out infinite alternate;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .laboratory-pet-sprite { animation: none !important; }
+  .laboratory-pet-body { transition: none; }
+}
+
+.laboratory-pet-hide {
+  position: absolute;
+  top: 0;
+  right: -8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--surface-sidebar);
+  color: var(--text-secondary);
+  opacity: 0;
+  cursor: pointer;
+}
+.laboratory-pet:hover .laboratory-pet-hide,
+.laboratory-pet-hide:focus-visible { opacity: 1; }
+
+.laboratory-pet[data-hidden] { width: 30px; height: 30px; }
+.laboratory-pet-show {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--surface-sidebar);
+  color: var(--text-secondary);
+  box-shadow: 0 0 0 1px var(--border-subtle);
+  cursor: pointer;
+}
+
+@keyframes laboratory-pet-pulse {
+  from { opacity: .65; }
+  to { opacity: 1; }
+}

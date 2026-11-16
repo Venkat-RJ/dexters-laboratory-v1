@@ -1,0 +1,236 @@
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { msg } from "@lingui/core/macro";
+import { i18n } from "../i18n";
+import { isBrowserHosted } from "../platform/browser-runtime";
+import { loadAppearance, type InterfaceLanguage } from "../settings/app-settings";
+import { disposeWhenSettled } from "./effect-helpers";
+import { marginReviewAvailable, marginReviewMode, subscribeMarginReview, type MarginReviewMode } from "../overleaf/margin-review-mode";
+
+/** Titles for the macOS menu bar, in the shape `set_native_locale` accepts. */
+export type NativeMenuLabels = {
+  about: string;
+  /** Lattice ▸ Check for Updates…, or Restart to Update… once one is installed; null where Lattice does not update itself. */
+  checkForUpdates: string | null;
+  /** Lattice ▸ Settings… (⌘,), the command table's `settings`. */
+  settings: string;
+  services: string;
+  hide: string;
+  hideOthers: string;
+  showAll: string;
+  quit: string;
+  file: string;
+  /** File's project items: the project title menu's actions, run as this window's commands (use-command-table.ts). */
+  newProject: string;
+  openFolder: string;
+  openRecent: string;
+  cloneRepository: string;
+  openFromOverleaf: string;
+  importZip: string;
+  exportZip: string;
+  exportArxiv: string;
+  /** File ▸ Open Recent: the other projects this window's switcher offers. */
+  recentProjects: { name: string; path: string }[];
+  /** Whether this window has a project, which the exports need. */
+  projectOpen: boolean;
+  edit: string;
+  undo: string;
+  redo: string;
+  cut: string;
+  copy: string;
+  paste: string;
+  selectAll: string;
+  view: string;
+  zoomIn: string;
+  zoomOut: string;
+  actualSize: string;
+  fullscreen: string;
+  window: string;
+  minimize: string;
+  zoom: string;
+  /** File ▸ Close Tab (⌘W), which closes a document tab, and the window once none is open. */
+  closeTab: string;
+  closeWindow: string;
+  help: string;
+  whatsNew: string;
+  /** Help ▸ Report a Problem…, the command table's `report-problem`. */
+  reportProblem: string;
+  /** The project's website and repository, linked from Help and the About panel. */
+  website: string;
+  github: string;
+  /** View → Margin review, while this window shows a linked Overleaf project's source; its choice is this window's. */
+  marginReview?: { title: string; auto: string; markers: string; off: string; mode: MarginReviewMode };
+};
+
+/** What File's project items depend on in this window. */
+export type NativeFileMenu = Pick<NativeMenuLabels, "recentProjects" | "projectOpen">;
+
+let fileMenu: NativeFileMenu = { recentProjects: [], projectOpen: false };
+
+/** What Lattice ▸ Check for Updates… does in this window: check, restart into an installed update, or nothing. */
+export type NativeUpdateMenu = "check" | "restart" | null;
+
+let updateMenu: NativeUpdateMenu = null;
+
+/** Set by the updater (app-updater.tsx); resent like File's items. */
+export function setNativeUpdateMenu(next: NativeUpdateMenu): void {
+  updateMenu = next;
+  syncNativeLocaleIfChanged();
+}
+
+/**
+ * Put this window's project and recent projects in File's items. The menu
+ * resends only when they changed, and only from the focused window.
+ */
+export function setNativeFileMenu(next: NativeFileMenu): void {
+  fileMenu = next;
+  syncNativeLocaleIfChanged();
+}
+
+// The menu keeps Apple's own wording (which can differ from the same English
+// word inside the app), so each title has its own catalog context. The context
+// must be a literal: Lingui extracts it statically.
+
+/** The menu bar titles in the active locale. */
+export function nativeMenuLabels(): NativeMenuLabels {
+  const name = "Dexter's Laboratory V1";
+  return {
+    about: i18n._(msg({ context: "macOS menu bar", message: `About ${name}` })),
+    checkForUpdates: updateMenu === "restart"
+      ? i18n._(msg({ context: "macOS menu bar", message: "Restart to Update…" }))
+      : updateMenu ? i18n._(msg({ context: "macOS menu bar", message: "Check for Updates…" })) : null,
+    settings: i18n._(msg({ context: "macOS menu bar", message: "Settings…" })),
+    services: i18n._(msg({ context: "macOS menu bar", message: "Services" })),
+    hide: i18n._(msg({ context: "macOS menu bar", message: `Hide ${name}` })),
+    hideOthers: i18n._(msg({ context: "macOS menu bar", message: "Hide Others" })),
+    showAll: i18n._(msg({ context: "macOS menu bar", message: "Show All" })),
+    quit: i18n._(msg({ context: "macOS menu bar", message: `Quit ${name}` })),
+    file: i18n._(msg({ context: "macOS menu bar", message: "File" })),
+    newProject: i18n._(msg({ context: "macOS menu bar", message: "New Project…" })),
+    openFolder: i18n._(msg({ context: "macOS menu bar", message: "Open…" })),
+    openRecent: i18n._(msg({ context: "macOS menu bar", message: "Open Recent" })),
+    cloneRepository: i18n._(msg({ context: "macOS menu bar", message: "Clone Repository…" })),
+    openFromOverleaf: i18n._(msg({ context: "macOS menu bar", message: "Open from Overleaf…" })),
+    importZip: i18n._(msg({ context: "macOS menu bar", message: "Import Overleaf ZIP…" })),
+    exportZip: i18n._(msg({ context: "macOS menu bar", message: "Export ZIP…" })),
+    exportArxiv: i18n._(msg({ context: "macOS menu bar", message: "Export for arXiv…" })),
+    recentProjects: fileMenu.recentProjects,
+    projectOpen: fileMenu.projectOpen,
+    edit: i18n._(msg({ context: "macOS menu bar", message: "Edit" })),
+    undo: i18n._(msg({ context: "macOS menu bar", message: "Undo" })),
+    redo: i18n._(msg({ context: "macOS menu bar", message: "Redo" })),
+    cut: i18n._(msg({ context: "macOS menu bar", message: "Cut" })),
+    copy: i18n._(msg({ context: "macOS menu bar", message: "Copy" })),
+    paste: i18n._(msg({ context: "macOS menu bar", message: "Paste" })),
+    selectAll: i18n._(msg({ context: "macOS menu bar", message: "Select All" })),
+    view: i18n._(msg({ context: "macOS menu bar", message: "View" })),
+    zoomIn: i18n._(msg({ context: "macOS menu bar", message: "Bigger" })),
+    zoomOut: i18n._(msg({ context: "macOS menu bar", message: "Smaller" })),
+    actualSize: i18n._(msg({ context: "macOS menu bar", message: "Actual Size" })),
+    fullscreen: i18n._(msg({ context: "macOS menu bar", message: "Enter Full Screen" })),
+    window: i18n._(msg({ context: "macOS menu bar", message: "Window" })),
+    minimize: i18n._(msg({ context: "macOS menu bar", message: "Minimize" })),
+    zoom: i18n._(msg({ context: "macOS menu bar", message: "Zoom" })),
+    closeTab: i18n._(msg({ context: "macOS menu bar", message: "Close Tab" })),
+    closeWindow: i18n._(msg({ context: "macOS menu bar", message: "Close Window" })),
+    help: i18n._(msg({ context: "macOS menu bar", message: "Help" })),
+    whatsNew: i18n._(msg({ context: "macOS menu bar", message: `What’s New in ${name}` })),
+    reportProblem: i18n._(msg({ context: "macOS menu bar", message: "Report a Problem…" })),
+    website: i18n._(msg({ context: "macOS menu bar", message: `Upstream Lattice Website` })),
+    github: i18n._(msg({ context: "macOS menu bar", message: `Upstream Lattice on GitHub` })),
+    ...marginReviewAvailable() ? {
+      marginReview: {
+        title: i18n._(msg({ context: "macOS menu bar", message: "Margin Review" })),
+        auto: i18n._(msg({ context: "macOS menu bar", message: "Auto" })),
+        markers: i18n._(msg({ context: "macOS menu bar", message: "Markers Only" })),
+        off: i18n._(msg({ context: "macOS menu bar", message: "Off" })),
+        mode: marginReviewMode(),
+      },
+    } : {},
+  };
+}
+
+/**
+ * The bundle localization AppKit should use for this app, or `null` to follow
+ * the system. Matches `CFBundleLocalizations` in src-tauri/Info.plist.
+ */
+export function bundleLanguage(preference: InterfaceLanguage): "en" | "zh-Hans" | null {
+  if (preference === "system") return null;
+  // eslint-disable-next-line lingui/no-unlocalized-strings -- Apple localization identifier
+  return preference === "zh-CN" ? "zh-Hans" : "en";
+}
+
+/**
+ * Hand the active locale to the native host: menu bar titles now, and the
+ * language of AppKit/WebKit panels and context menus from the next launch.
+ * A browser-hosted page has no menu bar of its own, but the file panels it
+ * opens are still drawn by the Lattice process.
+ */
+export function syncNativeLocale(preference: InterfaceLanguage = loadAppearance().interfaceLanguage): Promise<void> {
+  const menu = isBrowserHosted() ? null : nativeMenuLabels();
+  return invoke("set_native_locale", { menu, bundleLanguage: bundleLanguage(preference) });
+}
+
+// The last locale and preference sent while the sync is installed; `null`
+// when it is not.
+let lastSentLocaleKey: string | null = null;
+
+function syncQuietly(): void {
+  lastSentLocaleKey = currentLocaleKey();
+  void syncNativeLocale().catch(() => {
+    // Tests and browser previews have no native host.
+  });
+}
+
+// The margin review switch rides along: it is in the menu only while this
+// window shows margin review, and checked as this window has it. So do
+// File's project items, which follow this window's project.
+const currentLocaleKey = () =>
+  `${i18n.locale}|${loadAppearance().interfaceLanguage}|${marginReviewAvailable() ? marginReviewMode() : ""}|${JSON.stringify(fileMenu)}|${updateMenu}`;
+
+/**
+ * Resend when the locale, the saved preference, this window's margin review
+ * switch or File's project items moved since the last send.
+ * Switching between "system" and an explicit language that resolves to the
+ * same locale changes only the preference, so no catalog change reports it.
+ * A language chosen in another window reaches this one too (settings are
+ * shared), but only the focused window sends: the menu bar is app-wide, and a
+ * window in the background would put its own margin review item there. This
+ * one sends when it comes forward.
+ */
+export function syncNativeLocaleIfChanged(): void {
+  if (lastSentLocaleKey === null || !document.hasFocus()) return;
+  const key = currentLocaleKey();
+  if (key === lastSentLocaleKey) return;
+  syncQuietly();
+}
+
+/**
+ * Keep the native locale in step with the interface language. Call after the
+ * startup catalog is active. The menu bar is app-wide while each window holds
+ * its own locale, so a window that gains focus reapplies its labels.
+ */
+export function installNativeLocaleSync(): () => void {
+  // Lingui also reports catalog loads as changes; only a new locale or
+  // preference needs a rebuild.
+  syncQuietly();
+  const stopLocale = i18n.on("change", syncNativeLocaleIfChanged);
+  const stopMarginReview = subscribeMarginReview(syncNativeLocaleIfChanged);
+  let stopFocus = () => {};
+  if (!isBrowserHosted()) {
+    try {
+      const focusChanges = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        if (focused) syncQuietly();
+      });
+      stopFocus = disposeWhenSettled(focusChanges.catch(() => () => {}));
+    } catch {
+      // No native window outside the desktop shell.
+    }
+  }
+  return () => {
+    lastSentLocaleKey = null;
+    stopLocale();
+    stopMarginReview();
+    stopFocus();
+  };
+}

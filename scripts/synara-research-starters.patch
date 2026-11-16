@@ -1,0 +1,304 @@
+diff --git a/apps/web/src/components/chat/LatticeEmptyThread.logic.ts b/apps/web/src/components/chat/LatticeEmptyThread.logic.ts
+--- a/apps/web/src/components/chat/LatticeEmptyThread.logic.ts
++++ b/apps/web/src/components/chat/LatticeEmptyThread.logic.ts
+@@ -1,4 +1,4 @@
+-import type { LatticeHostContextSnapshot } from "../../embedMode";
++import { embedWorkspaceMatches, type EmbedModeConfig, type LatticeHostContextSnapshot } from "../../embedMode";
+ import { t } from "../../i18n";
+ 
+ /** The editor's selection actions, mirrored as starters with the same icons. */
+@@ -10,6 +10,45 @@
+   "proofread",
+   "references",
+ ];
++
++export type ResearchLanding = { stage: string | null; status: string; detail: string; completedPasses: number };
++
++export const RESEARCH_STARTERS = {
++  start: { title: "researchStartAction", prompt: "researchStartPrompt", icon: "polish" },
++  continue: { title: "researchContinueAction", prompt: "researchContinuePrompt", icon: "revise" },
++  prior: { title: "researchPriorAction", prompt: "researchPriorPrompt", icon: "references" },
++  gaps: { title: "researchGapsAction", prompt: "researchGapsPrompt", icon: "references" },
++  design: { title: "researchDesignAction", prompt: "researchDesignPrompt", icon: "revise" },
++  findings: { title: "researchFindingsAction", prompt: "researchFindingsPrompt", icon: "proofread" },
++} as const satisfies Record<string, { title: string; prompt: string; icon: LatticeStarterKind }>;
++
++type ResearchStarter = keyof typeof RESEARCH_STARTERS;
++
++export function researchStarterKinds(research: ResearchLanding): ResearchStarter[] {
++  const { stage, completedPasses } = research;
++  if (!stage) return ["start"];
++  if (stage === "analysis" || stage === "reporting" || (stage === "experiments" && research.status === "complete")) return ["continue", "findings", "gaps"];
++  if (stage === "ready" || stage === "setup" || stage === "experiments") return ["continue", "gaps", "design"];
++  return completedPasses > 0 ? ["continue", "gaps", "prior"] : ["continue", "prior"];
++}
++
++export function readResearchLandingMessage(event: MessageEvent, config: EmbedModeConfig): ResearchLanding | null | undefined {
++  if (
++    event.source !== window.parent || event.origin !== config.hostOrigin ||
++    event.data?.type !== "lattice:research-starters" ||
++    !embedWorkspaceMatches(config, event.data.workspaceRoot)
++  ) return undefined;
++  const value = event.data.research;
++  if (value === null) return null;
++  if (
++    !value || typeof value !== "object" ||
++    (value.stage !== null && typeof value.stage !== "string") ||
++    typeof value.status !== "string" ||
++    typeof value.detail !== "string" || value.detail.length > 500 ||
++    !Number.isInteger(value.completedPasses) || value.completedPasses < 0
++  ) return undefined;
++  return { stage: value.stage, status: value.status, detail: value.detail, completedPasses: value.completedPasses };
++}
+ 
+ export interface LatticeStarterCopy {
+   title: string;
+@@ -144,7 +183,9 @@
+   translate: typeof t = t,
+ ): string {
+   const typed = current.trim();
+-  const isStarterPrompt = LATTICE_STARTER_KINDS.some((kind) =>
++  const isStarterPrompt = Object.values(RESEARCH_STARTERS).some(({ prompt }) =>
++    translate(`lattice:${prompt}`).trim() === typed,
++  ) || LATTICE_STARTER_KINDS.some((kind) =>
+     [true, false].some(
+       (hasSelection) => latticeStarterPrompt(kind, hasSelection, translate).trim() === typed,
+     ),
+diff --git a/apps/web/src/components/chat/LatticeEmptyThread.tsx b/apps/web/src/components/chat/LatticeEmptyThread.tsx
+--- a/apps/web/src/components/chat/LatticeEmptyThread.tsx
++++ b/apps/web/src/components/chat/LatticeEmptyThread.tsx
+@@ -26,7 +26,10 @@
+   latticeSelectionPlace,
+   latticeStarterCopy,
+   latticeStarterPrompt,
++  RESEARCH_STARTERS,
++  researchStarterKinds,
+   type LatticeStarterKind,
++  type ResearchLanding,
+ } from "./LatticeEmptyThread.logic";
+ import { COMPOSER_OVERLAY_TUCK_PX } from "./composerOverlay";
+ 
+@@ -97,6 +100,7 @@
+ ]);
+ 
+ interface LatticeEmptyThreadProps {
++  research?: ResearchLanding | null;
+   /** The composer floats over the transcript's bottom; keep the starters clear of it. */
+   bottomInsetPx: number;
+   /** The selection's context bar, floating above the composer outside its inset. */
+@@ -129,6 +133,7 @@
+   bottomInsetPx,
+   contextBarHeightPx,
+   onStarter,
++  research,
+ }: LatticeEmptyThreadProps) {
+   const context = useSyncExternalStore(
+     subscribeLiveLatticeHostContext,
+@@ -137,6 +142,10 @@
+   );
+   const selectionPlace = latticeSelectionPlace(context, t);
+   const hasSelection = selectionPlace !== null;
++  const researchHome = hasSelection ? null : research;
++  const researchDetail = researchHome?.detail;
++  const researchStage = researchHome?.stage;
++  const completedPasses = researchHome?.completedPasses;
+ 
+   // A fit pass starts from the roomiest density and steps down, one render at
+   // a time inside the same layout phase, until the view fits; the generation
+@@ -159,7 +168,7 @@
+   }, []);
+   // What changes the content's size without resizing the viewport.
+   const selectionKey = selectionPlace ? `${selectionPlace.name}|${selectionPlace.detail}` : "";
+-  useLayoutEffect(refit, [refit, selectionKey, getFormatLocale()]);
++  useLayoutEffect(refit, [refit, selectionKey, researchHome != null, researchStage, researchDetail, completedPasses, getFormatLocale()]);
+   useLayoutEffect(() => {
+     const viewport = viewportRef.current;
+     if (!viewport) return;
+@@ -188,16 +197,21 @@
+   const showHint = density === "full" || density === "compact";
+   const showChip = showTitle && selectionPlace !== null;
+ 
+-  const starter = (kind: LatticeStarterKind) => {
+-    const Icon = STARTER_ICONS[kind];
+-    const copy = latticeStarterCopy(kind, t);
+-    const onClick = () => onStarter(latticeStarterPrompt(kind, hasSelection, t));
++  const starter = (kind: LatticeStarterKind | keyof typeof RESEARCH_STARTERS) => {
++    const researchStarter = kind in RESEARCH_STARTERS
++      ? RESEARCH_STARTERS[kind as keyof typeof RESEARCH_STARTERS] : undefined;
++    const icon = researchStarter?.icon ?? kind as LatticeStarterKind;
++    const Icon = STARTER_ICONS[icon];
++    const copy = researchStarter
++      ? { title: t(`lattice:${researchStarter.title}`), example: t(`lattice:${researchStarter.prompt}`) }
++      : latticeStarterCopy(icon, t);
++    const onClick = () => onStarter(researchStarter ? copy.example : latticeStarterPrompt(icon, hasSelection, t));
+     if (density === "icons") {
+       return (
+         <li key={kind} className="flex">
+           <button
+             type="button"
+-            data-starter={kind}
++            data-starter={icon}
+             aria-label={copy.title}
+             title={`${copy.title} · ${copy.example}`}
+             className={`${STARTER_SURFACE_CLASS_NAME} grid size-7 place-items-center rounded-full`}
+@@ -214,7 +228,7 @@
+         <li key={kind} className="flex max-w-full">
+           <button
+             type="button"
+-            data-starter={kind}
++            data-starter={icon}
+             title={copy.example}
+             className={`${STARTER_SURFACE_CLASS_NAME} flex h-7 max-w-full items-center gap-1.5 rounded-full pr-3 pl-2 text-[12.5px] leading-4 font-medium text-foreground`}
+             onClick={onClick}
+@@ -230,7 +244,7 @@
+       <li key={kind} className="flex min-w-0">
+         <button
+           type="button"
+-          data-starter={kind}
++          data-starter={icon}
+           title={compact ? copy.example : undefined}
+           className={`${STARTER_SURFACE_CLASS_NAME} group flex w-full min-w-0 gap-2.5 rounded-[10px] text-left ${compact ? "items-center p-1.5 pr-2.5" : "items-start p-2.5"}`}
+           onClick={onClick}
+@@ -288,16 +302,18 @@
+             <h2
+               className={`lattice-empty-thread-title font-normal text-balance text-foreground ${density === "chips" ? "text-[17px] leading-[22px]" : "text-[21px] leading-[26px]"}`}
+             >
+-              {t("lattice:workOnThisPaper")}
++              {t(researchHome ? "lattice:researchHomeTitle" : "lattice:workOnThisPaper")}
+             </h2>
+           ) : null}
+           {/* Chinese wraps at its punctuation, not between any two characters,
+               so a narrow panel never splits a word such as 编辑器. */}
+           {showHint ? (
+             <p className="mt-1.5 text-[12.5px] leading-[18px] text-balance break-keep text-muted-foreground">
+-              {hasSelection
+-                ? t("lattice:theseActOnTheSelectedTextOnly")
+-                : t("lattice:toWorkOnASinglePassageSelect")}
++              {researchHome
++                ? researchHome.detail || t("lattice:researchHomeHint")
++                : hasSelection
++                  ? t("lattice:theseActOnTheSelectedTextOnly")
++                  : t("lattice:toWorkOnASinglePassageSelect")}
+             </p>
+           ) : null}
+           {showChip && selectionPlace ? (
+@@ -346,7 +362,7 @@
+                     : "flex flex-wrap gap-1.5"
+             }
+           >
+-            {LATTICE_STARTER_KINDS.map(starter)}
++            {(researchHome ? researchStarterKinds(researchHome) : LATTICE_STARTER_KINDS).map(starter)}
+           </ul>
+         </div>
+       </div>
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -382,6 +382,7 @@
+ import { clearLatticeContextSelection } from "./chat/ComposerLatticeContextBar.logic";
+ import { LatticeEmptyThread } from "./chat/LatticeEmptyThread";
+ import { latticeStarterDraft } from "./chat/LatticeEmptyThread.logic";
++import { readResearchLandingMessage, type ResearchLanding } from "./chat/LatticeEmptyThread.logic";
+ import { ComposerTransportNotice } from "./chat/ComposerTransportNotice";
+ import { ComposerLiveChangesHeader } from "./chat/ComposerLiveChangesHeader";
+ import {
+@@ -2363,6 +2364,7 @@
+   // The selection's context bar floats above the composer, outside its
+   // measured height; the empty thread's starters keep clear of both.
+   const [latticeContextBarHeightPx, setLatticeContextBarHeightPx] = useState(0);
++  const [researchLanding, setResearchLanding] = useState<ResearchLanding | null>(null);
+   const handleLatticeStarter = useCallback((prompt: string) => {
+     latticeStarterPromptRef.current?.(prompt);
+   }, []);
+@@ -2386,6 +2388,7 @@
+           bottomInsetPx={composerTranscriptInsetPx}
+           contextBarHeightPx={latticeContextBarHeightPx}
+           onStarter={handleLatticeStarter}
++          research={researchLanding}
+         />
+       );
+     }
+@@ -2407,6 +2410,7 @@
+     composerTranscriptInsetPx,
+     handleLatticeStarter,
+     latticeContextBarHeightPx,
++    researchLanding,
+     handleRetryThreadDetailSync,
+     hasPendingThreadWork,
+     isEditorRail,
+@@ -2450,6 +2454,8 @@
+     const onHostMessage = (event: MessageEvent) => {
+       const context = readLatticeHostContextMessage(event, config);
+       if (context) setLiveLatticeHostContext(context);
++      const research = readResearchLandingMessage(event, config);
++      if (research !== undefined) setResearchLanding(research);
+       const papers = readLatticePaperLibraryMessage(event, config);
+       if (papers) setLatticePaperLibrary(papers);
+       // Parsing this message here preserves the host handshake even though the
+@@ -2464,6 +2470,7 @@
+     return () => {
+       window.removeEventListener("message", onHostMessage);
+       setLiveLatticeHostContext(null);
++      setResearchLanding(null);
+       setLatticePaperLibrary(null);
+     };
+   }, [isEmbed]);
+@@ -7295,7 +7302,7 @@
+                                     ? t("lattice:askAboutThisIssue")
+                                     : t("lattice:askAboutThisPullRequest")
+                                   : isEmbed
+-                                    ? t("lattice:doAnythingInLattice")
++                                    ? t(researchLanding ? "lattice:researchComposerPlaceholder" : "lattice:doAnythingInLattice")
+                                     : t("chat:doAnythingInSynara")
+                   }
+                   disabled={isComposerEditorDisabled}
+diff --git a/packages/shared/src/locales/en/lattice.json b/packages/shared/src/locales/en/lattice.json
+--- a/packages/shared/src/locales/en/lattice.json
++++ b/packages/shared/src/locales/en/lattice.json
+@@ -833,6 +833,21 @@
+   "whatIsThisProjectAbout": "What is this project about?",
+   "whatShouldThisSkillDo": "What should this skill do?",
+   "whenYouOrACoAuthorOpens": "When you or a co-author opens a pull request on GitHub, it shows up here",
++  "researchHomeTitle": "What would you like to investigate?",
++  "researchHomeHint": "Start with a question, an idea, or a result you want to understand.",
++  "researchComposerPlaceholder": "Ask Dexter about your research…",
++  "researchStartAction": "Start an investigation",
++  "researchStartPrompt": "Help me formulate the problem and define what would count as progress. My problem is: ",
++  "researchContinueAction": "Continue research",
++  "researchContinuePrompt": "Read the saved research state and project record. Continue from the next justified step within the existing scope.",
++  "researchPriorAction": "Find prior work",
++  "researchPriorPrompt": "Find relevant prior work for this question. Record the sources, competing claims, and open questions.",
++  "researchGapsAction": "Find gaps",
++  "researchGapsPrompt": "Review our question, sources, and mind map. Find missing evidence, unchecked assumptions, and overlooked approaches. Recommend the most useful gap to close next.",
++  "researchDesignAction": "Design an experiment",
++  "researchDesignPrompt": "Design an experiment for the most useful testable idea. Specify the baseline, metric, validation, and outcome that would change our decision. Save the plan for review.",
++  "researchFindingsAction": "Review findings",
++  "researchFindingsPrompt": "Review the saved results and their evidence. Explain which claims hold up, what remains uncertain, and what to investigate next. Use the existing results.",
+   "workOnThisPaper": "Work on this paper",
+   "workingTree": "Working tree",
+   "worktree": "worktree",
+diff --git a/packages/shared/src/locales/zh-CN/lattice.json b/packages/shared/src/locales/zh-CN/lattice.json
+--- a/packages/shared/src/locales/zh-CN/lattice.json
++++ b/packages/shared/src/locales/zh-CN/lattice.json
+@@ -833,6 +833,21 @@
+   "whatIsThisProjectAbout": "这个项目是做什么的？",
+   "whatShouldThisSkillDo": "这个 Skill 应该做什么？",
+   "whenYouOrACoAuthorOpens": "你或合作者在 GitHub 上发起 PR 后，会显示在这里",
++  "researchHomeTitle": "你想研究什么？",
++  "researchHomeHint": "从一个问题、一个想法，或一个你想理解的结果开始。",
++  "researchComposerPlaceholder": "向 Dexter 询问你的研究…",
++  "researchStartAction": "开始研究",
++  "researchStartPrompt": "帮我明确研究问题，以及如何判断是否取得进展。我的问题是：",
++  "researchContinueAction": "继续研究",
++  "researchContinuePrompt": "阅读已保存的研究状态和项目记录，在现有范围内继续下一项有依据的工作。",
++  "researchPriorAction": "查找已有研究",
++  "researchPriorPrompt": "查找与这个问题相关的已有研究，记录来源、相互竞争的观点和待解问题。",
++  "researchGapsAction": "寻找研究缺口",
++  "researchGapsPrompt": "检查研究问题、来源和思维导图，找出缺失的证据、未经检验的假设和被忽视的方法，并建议优先补上哪个缺口。",
++  "researchDesignAction": "设计实验",
++  "researchDesignPrompt": "为最有价值的可检验想法设计一个实验。说明基线、指标、验证方法和什么结果会改变我们的判断。保存计划以供审阅。",
++  "researchFindingsAction": "审视研究发现",
++  "researchFindingsPrompt": "检查已保存的结果及其证据。说明哪些结论站得住、哪些仍不确定，以及接下来值得研究什么。使用现有结果。",
+   "workOnThisPaper": "一起改这篇论文",
+   "workingTree": "工作区",
+   "worktree": "worktree",

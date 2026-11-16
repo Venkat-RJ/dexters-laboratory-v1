@@ -1,0 +1,13 @@
+# Research scratchpad
+
+Use root-level `scratchpad.tex` as the researcher's visible working memory. Capture interesting findings, surprising failures, useful equations, speculative directions and explicit “remember this” requests as they arise. This is a lightweight step throughout the investigation, not a gate or a separate research workflow.
+
+Before proposing directions or planning the next batch, scan relevant saved entries. Use stable SP-001-style IDs, a short title, the actual date, and a status such as idea, observed, unresolved, superseded or promoted. Explain the insight and why it matters. Add a source and locator, project path, map topic ID or attempt ID when relevant, plus what would make the entry worth revisiting. Resolve evidence paths from the existing source index or attempt records and check that links exist. Distinguish facts from hypotheses and preserve uncertainty.
+
+Keep one entry per useful insight, not one per tool call, optimizer iteration or experiment. Thousands of attempts belong in the tracker and structured evidence. Summarize a repeated pattern once and link its evidence. Append dated corrections or resolutions; preserve original entry IDs, user edits and earlier context. Do not silently turn a speculative note into an established result.
+
+When an idea becomes relevant, refer to its ID in the map notes, experiment note or manuscript and record its destination in the scratchpad. Main.tex remains the supported research record; research-log.md remains the action history. Avoid copying the same narrative into all three.
+
+For new projects the template already provides scratchpad.tex. For an older project, first read any existing scratchpad and preserve it. If absent, copy research-formulation/assets/scratchpad.tex without replacing any other file. The supplied scratchpad is a standalone LaTeX document with its own preamble. Do not insert it with \input into main.tex or make rough notes part of the final paper by default. Use the existing TeX editor and document build/preview when requested. Escape LaTeX special characters in prose and paths, use links where useful, and verify the scratchpad still compiles after substantial edits.
+
+While writing, research-state.json may use stage scratchpad with status running and a short detail, preserving completedPasses and review metadata. Restore the actual enclosing stage afterward. Do not clear a blocker or claim Ready because a note was saved. During map review, keep its stage and review identity intact while saving a scratchpad note. Scratchpad edits do not replace source evidence or independently approve a map.

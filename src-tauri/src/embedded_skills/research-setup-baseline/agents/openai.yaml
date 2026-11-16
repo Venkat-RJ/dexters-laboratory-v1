@@ -1,0 +1,4 @@
+interface:
+  display_name: "Setup and Baseline"
+  short_description: "Verify dependencies, compute and a measured baseline"
+  default_prompt: "Use $research-setup-baseline to prepare the project environment, test the evaluator and record a validated baseline."

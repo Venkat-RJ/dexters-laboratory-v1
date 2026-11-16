@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Dexter's Laboratory V1 Beta",
+  "mainBinaryName": "Dexter's Laboratory V1 Beta",
+  "identifier": "app.dexterslaboratory.v1.beta",
+  "plugins": {
+    "updater": {
+      "endpoints": []
+    }
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false
+  }
+}

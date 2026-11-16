@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design of Experiments"
+  short_description: "Plan useful tests, comparisons and resource limits"
+  default_prompt: "Use $research-experiment-planning to plan the next useful experiment."

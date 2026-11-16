@@ -1,0 +1,21 @@
+.git-graph { padding: var(--space-5); }
+.git-graph-lanes { margin-block: var(--space-4); }
+.git-graph-lanes > button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  text-align: start;
+  background: transparent;
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+}
+.git-graph-lanes > button:hover { background: var(--control-hover-surface); }
+.git-graph-lanes > button[aria-pressed="true"] { background: var(--control-pressed-surface); }
+.git-graph-lanes code {
+  white-space: pre;
+  line-height: 1.6;
+  flex: none;
+  color: var(--text-secondary);
+}
+.git-graph-lanes > button > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-graph-connector { display: block; }

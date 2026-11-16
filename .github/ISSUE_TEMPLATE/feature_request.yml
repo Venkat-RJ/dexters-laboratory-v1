@@ -1,0 +1,13 @@
+name: Feature request
+description: Suggest a research workflow improvement
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What research task are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested behavior

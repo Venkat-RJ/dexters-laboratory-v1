@@ -6,6 +6,17 @@ in a patch. See [SECURITY.md](SECURITY.md).
 
 ## Development setup
 
+For the simple macOS path, run `./scripts/setup.sh` after cloning. It prepares the
+tools and launches the app. `./scripts/setup.sh --no-run` prepares dependencies only.
+Apple Command Line Tools are required first. See the README for first use.
+
+The managed Synara checkout is `.synara-src/`, and the tool-manager executable is
+in `.source-tools/`. Both are Git-ignored. Node/pnpm and Rust use their standard
+per-user tool directories. Setup never resets an existing different or modified
+Synara checkout. It disables private-font discovery for the source launch.
+
+The following manual path remains available to contributors:
+
 The primary target is macOS 14 or later with Xcode Command Line Tools, Rust via
 rustup, Git, Node 22 and pnpm 10.13.1. `mise.toml` pins Node and pnpm.
 The agent runtime bundles its separately pinned Node version.
@@ -22,6 +33,7 @@ The following commands create the default sibling checkout on a fresh machine:
 ```sh
 git clone https://github.com/leo1oel/synara.git ../synara-v152-sync
 git -C ../synara-v152-sync checkout b14fd35abc28b224c02cf9b0eb809f3984683715
+mise exec -- ./node_modules/.bin/bun install --cwd ../synara-v152-sync --frozen-lockfile
 mise exec -- pnpm tauri dev
 ```
 
@@ -40,6 +52,7 @@ for document tools. No private fonts or build-time provider credentials are need
 pnpm exec tsc --noEmit
 pnpm exec tsc -p tsconfig.node.json --noEmit
 pnpm test
+node --test scripts/setup-source.node-test.mjs
 pnpm build
 cargo test --manifest-path src-tauri/lattice-core/Cargo.toml project::create
 ```

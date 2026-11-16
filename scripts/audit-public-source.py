@@ -13,7 +13,7 @@ parser.add_argument('--private-pattern', action='append', default=[], help='Addi
 args = parser.parse_args()
 root = args.root.resolve()
 # Generated trees are excluded from source review, and must not be distributed.
-skipped = {'.git', 'node_modules', 'target', 'dist', '.venv', '__pycache__'}
+skipped = {'.git', 'node_modules', 'target', 'dist', '.venv', '__pycache__', '.source-tools', '.synara-src'}
 forbidden_roots = {'research', 'private', '.claude', '.amp', '.codex'}
 secret_patterns = [
     r'(?<![A-Za-z0-9_-])sk-(?:proj-|ant-)?[A-Za-z0-9_-]{24,}',

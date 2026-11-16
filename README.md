@@ -47,11 +47,37 @@ batch boundaries. This is not a guarantee of automatic convergence or useful res
 
 ## Build from source
 
-This is the V1 **source preparation**, not a signed binary release.
-The primary desktop target is macOS 14 or later. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the pinned tools, Synara checkout and commands.
-Provider credentials and LaTeX tools are configured locally. No account, private
-research, provider key or prebuilt runtime is included.
+On **macOS 14 or later**, install Apple's Command Line Tools if you do not already
+have them (`xcode-select --install`), then run:
+
+```sh
+git clone https://github.com/Venkat-RJ/dexters-laboratory-v1.git
+cd dexters-laboratory-v1
+./scripts/setup.sh
+```
+
+The setup command prepares Rust, Node and pnpm, installs locked dependencies,
+fetches the pinned public Synara source, checks the runtimes, and builds and opens
+the desktop app. It does not require a sibling checkout, change your shell
+profile or use private research files. The first run needs an internet connection,
+several gigabytes of disk space and time to compile. Later runs reuse local builds.
+
+Setup opens a local development app and then exits. You can reopen
+`src-tauri/target/debug/bundle/macos/Dexter's Laboratory V1.app` directly without
+running a development server. Quit the app before rerunning setup to rebuild after
+pulling changes.
+Use `./scripts/setup.sh --no-run` to prepare dependencies without building or
+launching the desktop app. If setup fails, fix the reported problem and rerun it;
+setup refuses to overwrite changes in its Synara checkout.
+
+Once open, configure your provider in **Settings > Providers**, use **TeX doctor**
+for the document tools, then create a **Research workspace** and describe your
+problem in Agent chat. Provider accounts and any usage charges are your own.
+
+This is a source installation, not a signed installer. The setup command currently
+supports macOS only. See [CONTRIBUTING.md](CONTRIBUTING.md) for manual development
+and validation, and [the source-installation check](docs/source-installation.md)
+for what was tested. No account, private research or provider key is included.
 
 ## Records and privacy
 
